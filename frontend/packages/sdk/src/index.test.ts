@@ -24,16 +24,24 @@ vi.mock("@stellar/stellar-sdk", () => ({
 import {
   configure,
   hasClaim,
+  getClaim,
+  hasClaims,
   getClaims,
   verifyPreset,
+  buildVerifyUrl,
+  buildBadgeUrl,
+  buildBadgeEmbedCode,
+  parseReturnParams,
+  watchClaim,
+  withRetry,
   ConfigError,
   InvalidAddressError,
   RpcError,
   TimeoutError,
+  CLAIM_TYPES,
   StellarCred,
-  withRetry,
 } from "./index";
-import { hasClaim as sharedHasClaim } from "./claims";
+import * as claimsModule from "./claims";
 
 const WALLET = "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -224,7 +232,7 @@ describe("read request timeout", () => {
     vi.useRealTimers();
     isVerified.mockImplementation(() => new Promise(() => {}));
 
-    await expect(sharedHasClaim(WALLET, "kyc")).resolves.toBe(false);
+    await expect(claimsModule.hasClaim(WALLET, "kyc")).resolves.toBe(false);
   });
 
   it("returns false when check_claim never settles", async () => {
@@ -443,5 +451,100 @@ describe("verifyPreset", () => {
 
   it("is exported on the StellarCred namespace", () => {
     expect(StellarCred.verifyPreset).toBe(verifyPreset);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Function-identity: index.ts re-exports must be the same references as
+// claims.ts exports. If this test breaks, someone has added duplicate
+// implementations instead of re-exporting from claims.ts.
+// ---------------------------------------------------------------------------
+
+describe("function identity — index re-exports are the same references as claims", () => {
+  it("hasClaim is the same reference", () => {
+    expect(hasClaim).toBe(claimsModule.hasClaim);
+  });
+
+  it("getClaim is the same reference", () => {
+    expect(getClaim).toBe(claimsModule.getClaim);
+  });
+
+  it("hasClaims is the same reference", () => {
+    expect(hasClaims).toBe(claimsModule.hasClaims);
+  });
+
+  it("getClaims is the same reference", () => {
+    expect(getClaims).toBe(claimsModule.getClaims);
+  });
+
+  it("verifyPreset is the same reference", () => {
+    expect(verifyPreset).toBe(claimsModule.verifyPreset);
+  });
+
+  it("configure is the same reference", () => {
+    expect(configure).toBe(claimsModule.configure);
+  });
+
+  it("buildVerifyUrl is the same reference", () => {
+    expect(buildVerifyUrl).toBe(claimsModule.buildVerifyUrl);
+  });
+
+  it("buildBadgeUrl is the same reference", () => {
+    expect(buildBadgeUrl).toBe(claimsModule.buildBadgeUrl);
+  });
+
+  it("buildBadgeEmbedCode is the same reference", () => {
+    expect(buildBadgeEmbedCode).toBe(claimsModule.buildBadgeEmbedCode);
+  });
+
+  it("parseReturnParams is the same reference", () => {
+    expect(parseReturnParams).toBe(claimsModule.parseReturnParams);
+  });
+
+  it("watchClaim is the same reference", () => {
+    expect(watchClaim).toBe(claimsModule.watchClaim);
+  });
+
+  it("withRetry is the same reference", () => {
+    expect(withRetry).toBe(claimsModule.withRetry);
+  });
+
+  it("CLAIM_TYPES is the same reference", () => {
+    expect(CLAIM_TYPES).toBe(claimsModule.CLAIM_TYPES);
+  });
+
+  it("TimeoutError is the same reference", () => {
+    expect(TimeoutError).toBe(claimsModule.TimeoutError);
+  });
+
+  it("ConfigError is the same reference", () => {
+    expect(ConfigError).toBe(claimsModule.ConfigError);
+  });
+
+  it("InvalidAddressError is the same reference", () => {
+    expect(InvalidAddressError).toBe(claimsModule.InvalidAddressError);
+  });
+
+  it("RpcError is the same reference", () => {
+    expect(RpcError).toBe(claimsModule.RpcError);
+  });
+
+  it("StellarCred namespace functions are the same references as claims exports", () => {
+    expect(StellarCred.hasClaim).toBe(claimsModule.hasClaim);
+    expect(StellarCred.getClaim).toBe(claimsModule.getClaim);
+    expect(StellarCred.hasClaims).toBe(claimsModule.hasClaims);
+    expect(StellarCred.getClaims).toBe(claimsModule.getClaims);
+    expect(StellarCred.verifyPreset).toBe(claimsModule.verifyPreset);
+    expect(StellarCred.configure).toBe(claimsModule.configure);
+    expect(StellarCred.buildVerifyUrl).toBe(claimsModule.buildVerifyUrl);
+    expect(StellarCred.buildBadgeUrl).toBe(claimsModule.buildBadgeUrl);
+    expect(StellarCred.buildBadgeEmbedCode).toBe(claimsModule.buildBadgeEmbedCode);
+    expect(StellarCred.parseReturnParams).toBe(claimsModule.parseReturnParams);
+    expect(StellarCred.watchClaim).toBe(claimsModule.watchClaim);
+    expect(StellarCred.CLAIM_TYPES).toBe(claimsModule.CLAIM_TYPES);
+    expect(StellarCred.TimeoutError).toBe(claimsModule.TimeoutError);
+    expect(StellarCred.ConfigError).toBe(claimsModule.ConfigError);
+    expect(StellarCred.InvalidAddressError).toBe(claimsModule.InvalidAddressError);
+    expect(StellarCred.RpcError).toBe(claimsModule.RpcError);
   });
 });
