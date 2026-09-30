@@ -1,0 +1,27 @@
+name: Manage stale issues
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label inactive issues without closing them
+        uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          days-before-stale: 45
+          days-before-close: -1
+          stale-issue-label: stale
+          close-issue-label: stale-closed
+          stale-issue-message: >-
+            This issue has been inactive for 45 days. It remains open; please
+            add an update if it is still relevant or close it if the work is
+            no longer needed.
+          exempt-issue-labels: "security,blocked,good first issue"

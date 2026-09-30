@@ -36,12 +36,22 @@ jobs:
           node-version: 20
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run browser prover E2E test
+        shell: bash
+        working-directory: frontend
+        run: |
+          pnpm exec playwright test e2e/browser-prover-e2e.spec.ts
 
       - name: Install Stellar CLI
         shell: bash

@@ -1,9 +1,14 @@
 // @stellarcred/sdk
 //
 // A tiny, zero-dependency* read-only client for protocols integrating
-// StellarCred. The only thing a protocol trusts is the on-chain
+// StellarCred. By default the only thing a protocol trusts is the on-chain
 // ProofRegistry — there is no API key, no backend, and no personal data
 // handling. `hasClaim` is the primary integration call.
+//
+// Reads can optionally be sourced from a StellarCred indexer instead
+// (`{ source: "indexer" }`), which is much faster but trusts whoever operates
+// that indexer. It is off by default and must never be the sole basis for a
+// security decision. See the SDK README §Indexer fast path (issue #613).
 //
 // *Requires @stellar/stellar-sdk as a peer dependency.
 //
@@ -22,27 +27,21 @@
 //
 //   const ok = await StellarCred.hasClaim(walletAddress, "kyc");
 
-// ---------------------------------------------------------------------------
-// All implementation lives in claims.ts — this file is a thin re-export shell.
-// Do not add logic here. Do not import from index.ts in claims.ts / core.ts /
-// react.ts (that would create a circular dependency).
-// ---------------------------------------------------------------------------
+export * from "./claims";
+export * from "./challenge";
+export { createClaimGate } from "./core";
+export type { ClaimGateConfig, ClaimGateState, ClaimGateListener, ClaimGate } from "./core";
+export { useStellarCred } from "./react";
+export type { UseStellarCredOptions, UseStellarCredResult } from "./react";
 
-export {
-  // config
+import {
   configure,
   healthCheck,
   isConfigured,
-  // error classes
-  TimeoutError,
-  ConfigError,
-  InvalidAddressError,
-  RpcError,
-  // constants / types
-  CLAIM_TYPES,
-  // functions
   hasClaim,
   getClaim,
+  getClaimRecord,
+  checkClaimStatus,
   hasClaims,
   getClaims,
   verifyPreset,
@@ -52,24 +51,19 @@ export {
   parseReturnParams,
   watchClaim,
   withRetry,
+  CLAIM_TYPES,
+  TimeoutError,
+  ConfigError,
+  InvalidAddressError,
+  RpcError,
+  IndexerError,
 } from "./claims";
 
-export type {
-  ClaimType,
-  ClaimOptions,
-  Claim,
-  BatchClaimOptions,
-  PresetClaim,
-  PresetVerificationResult,
-  UntrustedReturnParams,
-  WatchClaimOptions,
-  WatchClaimCallbackOptions,
-} from "./claims";
-
-// ---------------------------------------------------------------------------
-// Namespace export (StellarCred.hasClaim / StellarCred.getClaims / etc.)
-// Re-imported from claims to guarantee these are the same function references.
-// ---------------------------------------------------------------------------
+import {
+  createWalletChallenge,
+  verifyWalletSignature,
+  verifyWalletClaim,
+} from "./challenge";
 
 import {
   configure,
@@ -98,6 +92,8 @@ export const StellarCred = {
   isConfigured,
   hasClaim,
   getClaim,
+  getClaimRecord,
+  checkClaimStatus,
   hasClaims,
   getClaims,
   verifyPreset,
@@ -106,18 +102,15 @@ export const StellarCred = {
   buildBadgeEmbedCode,
   parseReturnParams,
   watchClaim,
+  withRetry,
+  createWalletChallenge,
+  verifyWalletSignature,
+  verifyWalletClaim,
   CLAIM_TYPES,
   TimeoutError,
   ConfigError,
   InvalidAddressError,
   RpcError,
+  IndexerError,
 };
 export default StellarCred;
-
-// Framework-agnostic core — for use outside React (Vue, Svelte, vanilla).
-export { createClaimGate } from "./core";
-export type { ClaimGateConfig, ClaimGateState, ClaimGateListener, ClaimGate } from "./core";
-
-// React hook — React wrapper around the batched `hasClaims` read.
-export { useStellarCred } from "./react";
-export type { UseStellarCredOptions, UseStellarCredResult } from "./react";
