@@ -321,7 +321,7 @@ describe("SDK withRetry with exponential backoff", () => {
       retries: 3,
       baseDelayMs: 100,
       maxDelayMs: 1000,
-      jitter: false,
+      jitter: true,
     });
   });
 
@@ -339,47 +339,258 @@ describe("SDK withRetry with exponential backoff", () => {
 
   it("should fail fast if error is non-retryable", async () => {
     const operation = vi.fn().mockRejectedValue(new Error("invalid argument provided"));
-    
+
     await expect(withRetry(operation)).rejects.toThrow("invalid argument provided");
     expect(operation).toHaveBeenCalledTimes(1);
   });
 
-  it("should retry on transient errors and eventually succeed", async () => {
+  it("should retry transient errors with exponential backoff + jitter and eventually succeed", async () => {
     const operation = vi.fn()
       .mockRejectedValueOnce(new Error("network error"))
       .mockRejectedValueOnce(new Error("timeout"))
       .mockResolvedValueOnce("success");
 
-    let error: any;
-    const promise = withRetry(operation).catch(e => { error = e; });
-    
-    // First attempt fails, wait for delay (100ms)
+    const promise = withRetry(operation);
+    // First attempt fails -> wait one backoff window (~100ms)
     await vi.advanceTimersByTimeAsync(100);
-    // Second attempt fails, wait for delay (200ms)
+    expect(operation).toHaveBeenCalledTimes(2);
+    // Second attempt fails -> wait next backoff window (~200ms)
     await vi.advanceTimersByTimeAsync(200);
-
+    expect(operation).toHaveBeenCalledTimes(3);
+    // Third attempt succeeds
     await promise;
-    expect(error).toBeUndefined();
     expect(operation).toHaveBeenCalledTimes(3);
   });
 
-  it("should throw after max retries are exceeded", async () => {
+  it("should throw after max retries are exceeded on transient errors", async () => {
+    vi.useRealTimers();
+    configure({ retries: 3, baseDelayMs: 10, maxDelayMs: 50, jitter: false });
     const operation = vi.fn().mockRejectedValue(new Error("network error"));
 
-    let error: any;
-    const promise = withRetry(operation).catch(e => { error = e; });
-    
-    // Attempt 1 fails -> wait 100
-    await vi.advanceTimersByTimeAsync(100);
-    // Attempt 2 fails -> wait 200
-    await vi.advanceTimersByTimeAsync(200);
-    // Attempt 3 fails -> wait 400
-    await vi.advanceTimersByTimeAsync(400);
-
-    await promise;
-    expect(error).toBeDefined();
-    expect(error.message).toBe("network error");
+    const start = Date.now();
+    await expect(withRetry(operation)).rejects.toThrow("network error");
+    const elapsed = Date.now() - start;
     expect(operation).toHaveBeenCalledTimes(4); // initial + 3 retries
+    // Backoff (no jitter): 10 + 20 + 40 = 70 ms minimum
+    expect(elapsed).toBeGreaterThanOrEqual(70);
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("should jitter the backoff in the configured range", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    configure({ retries: 1, baseDelayMs: 100, maxDelayMs: 1000, jitter: true });
+    const operation = vi.fn().mockRejectedValue(new Error("network error"));
+    const start = Date.now();
+    const promise = withRetry(operation).catch(() => {});
+    // With jitter enabled, baseDelayMs * 2^1 = 200ms window, halved by jitter -> 50-150ms
+    await vi.advanceTimersByTimeAsync(150);
+    await promise;
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(50);
+    expect(elapsed).toBeLessThanOrEqual(150);
+    vi.useRealTimers();
+  });
+
+  it("should disable jitter when jitter is false", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    configure({ retries: 1, baseDelayMs: 100, maxDelayMs: 1000, jitter: false });
+    const operation = vi.fn().mockRejectedValue(new Error("network error"));
+    const start = Date.now();
+    const promise = withRetry(operation).catch(() => {});
+    // Without jitter, baseDelayMs * 2^1 = 200ms exactly
+    await vi.advanceTimersByTimeAsync(200);
+    await promise;
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBe(200);
+    vi.useRealTimers();
+  });
+
+  it("should retry 429 and 5xx transient errors", async () => {
+    vi.useRealTimers();
+    configure({ retries: 2, baseDelayMs: 10, maxDelayMs: 50, jitter: false });
+
+    const operation = vi.fn()
+      .mockRejectedValueOnce({ status: 429, message: "Too many requests" })
+      .mockRejectedValueOnce({ status: 503, message: "Service Unavailable" })
+      .mockResolvedValueOnce("ok");
+
+    const start = Date.now();
+    await expect(withRetry(operation)).resolves.toBe("ok");
+    const elapsed = Date.now() - start;
+    expect(operation).toHaveBeenCalledTimes(3);
+    // Backoff (no jitter): 10 + 20 = 30 ms minimum
+    expect(elapsed).toBeGreaterThanOrEqual(30);
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("should NOT retry 400 bad request errors", async () => {
+    configure({ retries: 3, baseDelayMs: 50, maxDelayMs: 500 });
+
+    const operation = vi.fn().mockRejectedValue(new Error("bad request"));
+
+    await expect(withRetry(operation)).rejects.toThrow("bad request");
+    expect(operation).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── normalized error types exposed to callers (Issue #744) ────────────────
+
+describe("normalized RPC errors exposed to callers", () => {
+  beforeEach(() => {
+    isVerified.mockReset();
+    checkClaim.mockReset();
+    configure({ registryId: "C_TEST_REGISTRY", retries: 0 });
+  });
+
+  it("surfaces a stable RpcError.code for transient failures", async () => {
+    configure({ registryId: "C_TEST_REGISTRY" });
+    isVerified.mockRejectedValue({ status: 429, message: "Too many requests" });
+
+    const err = await hasClaim(WALLET, "kyc", { throwOnError: true }).catch((e: any) => e);
+    expect(err).toBeInstanceOf(RpcError);
+    expect((err as any).code).toBe("RPC_RATE_LIMITED");
+    expect(typeof (err as any).message).toBe("string");
+    expect((err as any).cause).toEqual({ status: 429, message: "Too many requests" });
+  });
+
+  it("surfaces a stable RpcError.code for server errors", async () => {
+    configure({ registryId: "C_TEST_REGISTRY" });
+    isVerified.mockRejectedValue({ status: 503, message: "Service Unavailable" });
+
+    const err = await hasClaim(WALLET, "kyc", { throwOnError: true }).catch((e: any) => e);
+    expect((err as any).code).toBe("RPC_SERVER_ERROR");
+  });
+
+  it("surfaces a stable RpcError.code for timeout failures", async () => {
+    configure({ registryId: "C_TEST_REGISTRY" });
+    isVerified.mockRejectedValue(new Error("request timed out"));
+
+    const err = await hasClaim(WALLET, "kyc", { throwOnError: true }).catch((e: any) => e);
+    expect((err as any).code).toBe("RPC_TIMEOUT");
+  });
+
+  it("keeps cause even when an actionable message is surfaced", async () => {
+    configure({ registryId: "C_TEST_REGISTRY" });
+    isVerified.mockRejectedValue({ status: 500, message: "Internal Server Error" });
+
+    const err = await hasClaim(WALLET, "kyc", { throwOnError: true }).catch((e: any) => e);
+    expect((err as any).cause).toEqual({ status: 500, message: "Internal Server Error" });
+    expect(typeof (err as any).message).toBe("string");
+    expect((err as any).message.toLowerCase()).toContain("retry");
+  });
+
+  it("still throws RpcError when simulation fails (non-transient)", async () => {
+    configure({ registryId: "C_TEST_REGISTRY" });
+    isVerified.mockRejectedValue(new Error("invalid argument provided"));
+
+    const err = await hasClaim(WALLET, "kyc", { throwOnError: true }).catch((e: any) => e);
+    expect(err).toBeInstanceOf(RpcError);
+    expect((err as any).code).toBe("RPC_SIMULATION_FAILED");
+  });
+});
+
+// ── transient error classification (Issue #744) ──────────────────────────
+
+import { classifyTransientError, isTransient, formatTransientErrorMessage } from "./errors";
+
+describe("transient error classification (Issue #744)", () => {
+  it("classifies HTTP 429 as RPC_RATE_LIMITED", () => {
+    const err = { status: 429, message: "Too many requests" };
+    expect(classifyTransientError(err).code).toBe("RPC_RATE_LIMITED");
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("classifies HTTP 429 in the message field", () => {
+    const err = new Error("Request failed with status code 429");
+    expect(classifyTransientError(err).code).toBe("RPC_RATE_LIMITED");
+  });
+
+  it("classifies HTTP 503 as RPC_SERVER_ERROR", () => {
+    const err = { status: 503, message: "Service Unavailable" };
+    expect(classifyTransientError(err).code).toBe("RPC_SERVER_ERROR");
+    expect(classifyTransientError(err).message).toContain("503");
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("classifies a transport timeout as RPC_TIMEOUT", () => {
+    const err = new Error("request timed out after 10000ms");
+    expect(classifyTransientError(err).code).toBe("RPC_TIMEOUT");
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("classifies ECONNRESET as RPC_TIMEOUT", () => {
+    const err = { message: "read ECONNRESET", name: "error" };
+    expect(classifyTransientError(err).code).toBe("RPC_TIMEOUT");
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("classifies fetch failures as RPC_TIMEOUT", () => {
+    const err = { message: "fetch failed", name: "error" };
+    expect(classifyTransientError(err).code).toBe("RPC_TIMEOUT");
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("classifies a dropped-network message as RPC_TIMEOUT", () => {
+    const err = new Error("network down");
+    expect(classifyTransientError(err).code).toBe("RPC_TIMEOUT");
+  });
+
+  it("classifies an AbortError-style name as RPC_TIMEOUT", () => {
+    const err = { message: "request was aborted", name: "AbortedError" };
+    expect(classifyTransientError(err).code).toBe("RPC_TIMEOUT");
+  });
+
+  it("classifies unknown errors as UNKNOWN_RPC_ERROR (transient, retried)", () => {
+    const err = new Error("something broke");
+    const info = classifyTransientError(err);
+    expect(info.code).toBe("UNKNOWN_RPC_ERROR");
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("does NOT treat invalid argument as transient", () => {
+    const err = new Error("invalid argument provided");
+    expect(isTransient(err)).toBe(false);
+    expect(classifyTransientError(err).code).toBe("RPC_SIMULATION_FAILED");
+  });
+
+  it("does NOT treat bad request as transient", () => {
+    const err = new Error("bad request");
+    expect(isTransient(err)).toBe(false);
+  });
+
+  it("does NOT treat parse error as transient", () => {
+    const err = { message: "parse error", name: "Error" };
+    expect(isTransient(err)).toBe(false);
+  });
+
+  it("does NOT treat not found as transient", () => {
+    const err = { message: "not found", status: 404 };
+    expect(isTransient(err)).toBe(false);
+  });
+
+  it("still treats not-found-like rate-limit wording as transient", () => {
+    const err = { message: "not found: try again later" };
+    expect(isTransient(err)).toBe(true);
+    expect(classifyTransientError(err).code).toBe("RPC_RATE_LIMITED");
+  });
+
+  it("returns a stable, actionable message for transient failures", () => {
+    const err = { status: 502, message: "Bad Gateway" };
+    const msg = formatTransientErrorMessage(err);
+    expect(msg).toContain("502");
+    expect(msg.toLowerCase()).toContain("retry");
+  });
+
+  it("returns a readable message for non-transient failures", () => {
+    const err = new Error("invalid argument provided");
+    const msg = formatTransientErrorMessage(err);
+    expect(msg).toContain("not retryable");
+    expect(msg).toContain("invalid client input");
+  });
+
+  it("returns a readable message for null/undefined errors", () => {
+    expect(classifyTransientError(null).code).toBe("UNKNOWN_RPC_ERROR");
+    expect(typeof formatTransientErrorMessage(undefined)).toBe("string");
   });
 });
 

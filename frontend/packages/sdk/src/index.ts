@@ -189,6 +189,12 @@ function warnIfMissingRegistryIdOnce(): void {
 // Types and Errors
 // ---------------------------------------------------------------------------
 
+import {
+  classifyTransientError,
+  isTransient,
+  type TransientErrorCode,
+} from "./errors";
+
 /** Error thrown when watchClaim times out. */
 export class TimeoutError extends Error {
   constructor(message = "Timeout waiting for claim") {
@@ -229,15 +235,33 @@ export class InvalidAddressError extends Error {
  * timeout at the transport layer, simulation error, etc.). Only surfaces
  * when `{ throwOnError: true }` is passed — distinguishing "couldn't check"
  * from "not verified" (`false`).
+ *
+ * `code` is a stable, machine-routable classifier of what went wrong with the
+ * underlying transaction submission to the Soroban RPC, so callers can route
+ * retries (e.g. back-off on `RPC_RATE_LIMITED`/`RPC_SERVER_ERROR`) without
+ * parsing the raw exception.
  */
 export class RpcError extends Error {
   /** Underlying transport / simulation failure, when available. */
   cause?: unknown;
+  /** Stable classification of the RPC failure that caused this error. */
+  code: TransientErrorCode;
   constructor(message = "StellarCred RPC call failed", options?: { cause?: unknown }) {
     super(message);
     this.name = "RpcError";
     if (options && "cause" in options) {
       this.cause = options.cause;
+    }
+    // Normalize the underlying failure to a stable code + actionable message
+    // so callers don't have to parse SDK-internal error strings.
+    const info = classifyTransientError(options?.cause);
+    this.code = info.code;
+    // Surface the actionable message from classification; preserve a human
+    // operation label appended when the caller supplied a descriptive message.
+    if (!message || message === "StellarCred RPC call failed") {
+      this.message = info.message;
+    } else {
+      this.message = `${message} — ${info.message}`;
     }
   }
 }
@@ -394,20 +418,8 @@ async function fanOut<T, R>(
   return Promise.all(items.map(fn));
 }
 
-function isRetryable(error: any): boolean {
-  if (error && typeof error.message === "string") {
-    const msg = error.message.toLowerCase();
-    // Non-retryable errors (e.g., bad args, 400 Bad Request, parsing errors)
-    if (
-      msg.includes("invalid argument") ||
-      msg.includes("bad request") ||
-      msg.includes("not found") ||
-      msg.includes("parse error")
-    ) {
-      return false;
-    }
-  }
-  return true;
+function isRetryable(error: unknown): boolean {
+  return isTransient(error);
 }
 
 class ReadTimeoutError extends Error {
@@ -434,7 +446,7 @@ export async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
   while (true) {
     try {
       return await operation();
-    } catch (error: any) {
+    } catch (error) {
       if (attempt >= retries || !isRetryable(error)) {
         throw error;
       }
