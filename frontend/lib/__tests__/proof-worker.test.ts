@@ -115,6 +115,7 @@ function cloneMessage(message: ProofWorkerEvent): ProofWorkerEvent {
       publicInputs: new Uint8Array(message.publicInputs),
     };
   }
+  // stageProgress and all other plain-object events are safely spread.
   return { ...message };
 }
 
@@ -212,6 +213,54 @@ describe("prover worker: happy path", () => {
     );
 
     // witness first (from the worker itself), then bb.js's own stages.
+    expect(stages).toEqual(["witness", "circuit", "proof"]);
+  });
+
+  it("delivers stageProgress detail (label, expectedMs) for each stage via onStageProgress", async () => {
+    proveWithBackend.mockImplementation((_type, _witness, _signal, onStep) => {
+      onStep?.("circuit");
+      onStep?.("proof");
+      return Promise.resolve(PROOF);
+    });
+    const { proveOffMainThread } = await loadClient();
+    const progressEvents: Array<{ stage: string; expectedMs: number; label: string }> = [];
+
+    await proveOffMainThread(
+      { credentialType: "age", credential: {} },
+      {
+        onStageProgress: (p) =>
+          progressEvents.push({ stage: p.stage, expectedMs: p.expectedMs, label: p.label }),
+      },
+    );
+
+    // One stageProgress per stage start (elapsedMs=0 initial post).
+    // The 500 ms interval fires are suppressed because jsdom's fake clock
+    // doesn't advance automatically; only the synchronous initial posts arrive.
+    const stages = progressEvents.map((p) => p.stage);
+    expect(stages).toEqual(["witness", "circuit", "proof"]);
+
+    // Every event carries a non-zero expectedMs and a non-empty label.
+    for (const p of progressEvents) {
+      expect(p.expectedMs).toBeGreaterThan(0);
+      expect(p.label.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("delivers stageProgress on the inline fallback path too", async () => {
+    vi.stubGlobal("Worker", undefined);
+    proveWithBackend.mockImplementation((_type, _witness, _signal, onStep) => {
+      onStep?.("circuit");
+      onStep?.("proof");
+      return Promise.resolve(PROOF);
+    });
+    const { proveOffMainThread } = await loadClient();
+    const stages: string[] = [];
+
+    await proveOffMainThread(
+      { credentialType: "age", credential: {} },
+      { onStageProgress: (p) => stages.push(p.stage) },
+    );
+
     expect(stages).toEqual(["witness", "circuit", "proof"]);
   });
 
@@ -363,6 +412,25 @@ describe("prover worker: failures", () => {
     await expect(
       proveOffMainThread({ credentialType: "age", credential: {} }),
     ).rejects.toThrow("Witness generation failed: 500 boom");
+  });
+
+  it("rebuilds a circuit-version mismatch as its real type, not a bare Error", async () => {
+    // The circuit-version gate (#633) throws a typed error so the UI can show
+    // it without the generic "proof generation failed" wrapper. Only the name
+    // survives the worker boundary, so the client has to restore the type —
+    // otherwise the check would pass on the inline fallback and silently fail
+    // on the worker path that production actually takes.
+    const { proveOffMainThread } = await loadClient();
+    // From the module registry loadClient just populated, so `instanceof` below
+    // is the same identity check the UI makes. (beforeEach calls
+    // vi.resetModules(), so the statically-imported class would be a different
+    // object and the assertion would be meaningless.)
+    const { CircuitVersionMismatchError: Revived } = await import("../circuit-versions");
+    computeWitness.mockRejectedValue(new Revived("issued against 0.9.0"));
+
+    await expect(
+      proveOffMainThread({ credentialType: "age", credential: {} }),
+    ).rejects.toBeInstanceOf(Revived);
   });
 
   it("surfaces a non-Error rejection without losing it", async () => {

@@ -12,20 +12,25 @@
 // to know which path it got.
 
 import type { GeneratedProof, ProverCircuit } from "./proof";
+import { CircuitVersionMismatchError } from "./circuit-versions";
 import type {
   ProofJobRequest,
   ProofStage,
+  ProofStageProgress,
   ProofWorkerCommand,
   ProofWorkerEvent,
 } from "./proof-protocol";
+import { PROOF_PERF_TARGETS } from "./proof-perf";
 
-export type { ProofJobRequest, ProofStage };
+export type { ProofJobRequest, ProofStage, ProofStageProgress };
 
 export interface ProveOptions {
   /** Aborting this cancels the job — inside the worker, not just locally. */
   signal?: AbortSignal;
   /** Called for each stage the worker reports, on the main thread. */
   onProgress?: (stage: ProofStage) => void;
+  /** Called with detailed progress information including elapsed time and expected duration. */
+  onStageProgress?: (progress: ProofStageProgress) => void;
 }
 
 interface ProofJob {
@@ -48,8 +53,19 @@ function abortError(): DOMException {
   return new DOMException("Aborted", "AbortError");
 }
 
-/** Rebuild an Error from the name/message pair the worker sent back. */
+/**
+ * Rebuild an Error from the name/message pair the worker sent back.
+ *
+ * The `name` is what lets the two paths stay behaviourally identical: a typed
+ * error thrown inside the worker loses its prototype crossing the boundary, so
+ * it is reconstructed here. Without this, `instanceof` checks in the UI would
+ * pass on the main-thread fallback and silently fail on the worker path —
+ * which is the path production actually takes.
+ */
 function reviveError(name: string, message: string): Error {
+  if (name === "CircuitVersionMismatchError") {
+    return new CircuitVersionMismatchError(message);
+  }
   const err = new Error(message);
   err.name = name;
   return err;
@@ -86,6 +102,13 @@ function onWorkerMessage(event: MessageEvent<ProofWorkerEvent>): void {
       const job = jobs.get(msg.jobId);
       if (!job || job.settled) return;
       job.options.onProgress?.(msg.stage);
+      return;
+    }
+
+    case "stageProgress": {
+      const job = jobs.get(msg.jobId);
+      if (!job || job.settled) return;
+      job.options.onStageProgress?.(msg.progress);
       return;
     }
 
@@ -193,6 +216,15 @@ async function loadProofEngine(): Promise<ProofEngine> {
 }
 
 /**
+ * Expected durations for inline progress tracking, mirroring the worker's STAGE_INFO.
+ */
+const INLINE_STAGE_INFO: Record<ProofStage, { label: string; expectedMs: number }> = {
+  witness: { label: "Generating witness", expectedMs: PROOF_PERF_TARGETS.witnessMs },
+  circuit: { label: "Loading circuit WASM", expectedMs: 5000 },
+  proof: { label: "Generating UltraPlonk proof", expectedMs: PROOF_PERF_TARGETS.proveMs - 5000 },
+};
+
+/**
  * The main-thread path: identical orchestration to the worker's, minus the
  * thread. Used when workers are unavailable and to replay jobs when a worker
  * dies.
@@ -205,14 +237,21 @@ async function proveInline(
   const { signal } = options;
   if (signal?.aborted) throw abortError();
 
-  options.onProgress?.("witness");
+  const emitStageProgress = (stage: ProofStage): void => {
+    if (signal?.aborted) return;
+    options.onProgress?.(stage);
+    const info = INLINE_STAGE_INFO[stage];
+    options.onStageProgress?.({ stage, elapsedMs: 0, expectedMs: info.expectedMs, label: info.label });
+  };
+
+  emitStageProgress("witness");
   const witness = request.aggregate
     ? await engine.computeAggregateWitness(request.aggregate, signal)
     : await engine.computeWitness(request.credentialType, request.credential ?? {}, signal);
   if (signal?.aborted) throw abortError();
 
   return engine.proveWithBackend(request.credentialType, witness, signal, (stage) => {
-    if (!signal?.aborted) options.onProgress?.(stage);
+    if (!signal?.aborted) emitStageProgress(stage);
   });
 }
 

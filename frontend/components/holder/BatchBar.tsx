@@ -1,6 +1,6 @@
 "use client";
 
-import { IconStack2 } from "@tabler/icons-react";
+import { IconStack2, IconTrash } from "@tabler/icons-react";
 import { MAX_BATCH_SIZE } from "@/lib/contracts";
 import { proofSubmissionConfigured } from "@/lib/config";
 
@@ -11,6 +11,7 @@ export function BatchBar({
   onProveBatch,
   onClear,
   onSelectEligible,
+  onRemoveSelected,
 }: {
   selectedCount: number;
   atBatchLimit: boolean;
@@ -18,6 +19,8 @@ export function BatchBar({
   onProveBatch: () => void;
   onClear: () => void;
   onSelectEligible: () => void;
+  /** When provided, renders a "Remove selected" danger button. */
+  onRemoveSelected?: () => void;
 }) {
   return (
     <div
@@ -49,6 +52,16 @@ export function BatchBar({
             ? `Prove ${selectedCount} selected in one transaction`
             : "Prove several in one transaction"}
         </button>
+        {selectedCount > 0 && onRemoveSelected && (
+          <button
+            className="btn btn-ghost btn-sm"
+            style={{ color: "#ef4444" }}
+            onClick={onRemoveSelected}
+          >
+            <IconTrash size={14} style={{ marginRight: "0.25rem" }} />
+            Remove selected ({selectedCount})
+          </button>
+        )}
         {selectedCount > 0 ? (
           <button className="btn btn-ghost btn-sm" onClick={onClear}>
             Clear
@@ -64,7 +77,7 @@ export function BatchBar({
           ? `Batch full — ${MAX_BATCH_SIZE} of ${MAX_BATCH_SIZE} selected.`
           : selectedCount === 0
             ? `Select up to ${MAX_BATCH_SIZE} credentials, one per credential type.`
-            : `${selectedCount} of ${MAX_BATCH_SIZE} selected \u00b7 one per credential type.`}
+            : `${selectedCount} of ${MAX_BATCH_SIZE} selected · one per credential type.`}
       </span>
     </div>
   );

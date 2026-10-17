@@ -17,6 +17,9 @@ const processPath = require.resolve("process/browser");
 const nextConfig = {
   reactStrictMode: true,
 
+  // Disable Google Fonts optimization to avoid network errors during build
+  optimizeFonts: false,
+
   // The /api/issue route runs Noir server-side to compute the Poseidon
   // commitment. Keep these out of the server bundle so Node require()s them
   // from node_modules and resolves their CJS/"nodejs" entry points, which read
@@ -49,6 +52,7 @@ const nextConfig = {
     // Applying ProvidePlugin on the server replaces Node's real `process`
     // with `process/browser` (env: {}), which hides server-only env vars
     // like ISSUER_PRIVATE_KEY even after they are set in .env.local.
+    config.plugins.push(new webpack.NormalModuleReplacementPlugin(/@ledgerhq\/devices\/hid-framing/, (resource) => { resource.request = "@ledgerhq/devices/lib-es/hid-framing.js"; }));
     if (!isServer) {
       config.resolve.fallback = {
         ...config.resolve.fallback,
@@ -124,11 +128,55 @@ const nextConfig = {
       csp.push("frame-src 'self' https://verify.walletconnect.com https://verify.walletconnect.org");
     }
 
+    // Allow framing for the badge route (#532): it's designed to be embedded
+    // in third-party sites via iframe. An optional BADGE_ALLOWED_ORIGINS env
+    // var can restrict which origins may embed it (comma-separated list);
+    // defaults to allowing all origins when unset.
+    const badgeAllowedOrigins = process.env.BADGE_ALLOWED_ORIGINS
+      ? process.env.BADGE_ALLOWED_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+      : [];
+    
+    const badgeFrameAncestors =
+      badgeAllowedOrigins.length > 0
+        ? `frame-ancestors ${badgeAllowedOrigins.join(" ")}`
+        : "frame-ancestors *";
+
+    const badgeCsp = [
+      ...csp,
+      badgeFrameAncestors,
+    ].join("; ") + ";";
+
+    const defaultCsp = [
+      ...csp,
+      "frame-ancestors 'none'",
+    ].join("; ") + ";";
+
     return [
       {
+        // Badge route: frameable by default (#532)
+        source: "/badge",
+        headers: [
+          { key: "Content-Security-Policy", value: badgeCsp },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=63072000; includeSubDomains",
+          },
+          // X-Frame-Options has no "allow all" value; omit it for the badge
+          // route and rely on CSP frame-ancestors for modern browsers. Legacy
+          // browsers without CSP support will allow framing by default.
+          { key: "Permissions-Policy", value: "camera=()" },
+          // Badge doesn't need cross-origin isolation (no WASM proving)
+          { key: "Cross-Origin-Opener-Policy", value: "unsafe-none" },
+          { key: "Cross-Origin-Embedder-Policy", value: "unsafe-none" },
+        ],
+      },
+      {
+        // All other routes: deny framing
         source: "/:path*",
         headers: [
-          { key: "Content-Security-Policy", value: csp.join("; ") + ";" },
+          { key: "Content-Security-Policy", value: defaultCsp },
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           {

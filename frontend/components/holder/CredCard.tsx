@@ -24,6 +24,13 @@ import {
 } from "@/lib/proof-helpers";
 import type { Credential } from "@/lib/credential";
 
+export interface BatchSelection {
+  checked: boolean;
+  /** Why this card cannot be added to the batch, or null when it can. */
+  blockedReason: string | null;
+  onToggle: () => void;
+}
+
 export function CredCard({
   c,
   address,
@@ -31,6 +38,7 @@ export function CredCard({
   onRemove,
   onInspect,
   isPreview,
+  selection,
 }: {
   c: Credential;
   address: string;
@@ -38,6 +46,8 @@ export function CredCard({
   onRemove: () => void;
   onInspect?: () => void;
   isPreview?: boolean;
+  /** When present, renders a batch-selection checkbox. Omit for non-batchable cards. */
+  selection?: BatchSelection;
 }) {
   const status = proofStatus(c);
   const { events } = useProofTimeline(c);
@@ -94,6 +104,17 @@ export function CredCard({
 
         {/* right: badges + buttons */}
         <div className="card-actions">
+          {selection && (
+            <input
+              type="checkbox"
+              checked={selection.checked}
+              disabled={!selection.checked && selection.blockedReason !== null}
+              title={selection.blockedReason ?? undefined}
+              onChange={selection.onToggle}
+              aria-label={`Select ${c.title} for batch`}
+              style={{ cursor: selection.blockedReason && !selection.checked ? "not-allowed" : "pointer" }}
+            />
+          )}
           {isPreview && <Badge variant="pending">Preview</Badge>}
           <Badge variant="verified" dot={false}>Held</Badge>
           {status === "proved" && !isExpiringSoon(c) && (

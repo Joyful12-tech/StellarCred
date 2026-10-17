@@ -2,7 +2,7 @@
 
 An event ingestion and query service for StellarCred's on-chain Soroban contracts.
 
-The indexer continuously polls Soroban contract events emitted by `ProofRegistry` (and other registry contracts), ingests them into a local database (SQLite or PostgreSQL), and exposes a lightweight read-only HTTP API for client applications, wallets, and community explorers.
+The indexer continuously polls Soroban contract events emitted by `ProofRegistry` (and other registry contracts), ingests them into a local database (SQLite or PostgreSQL), and exposes a lightweight HTTP API for client applications, wallets, and community explorers. Read endpoints are public by default; authenticated app review and webhook subscription management are write operations.
 
 ---
 
@@ -12,7 +12,9 @@ The indexer continuously polls Soroban contract events emitted by `ProofRegistry
 - **Pluggable Database Storage**: Supports SQLite (for local development and single-instance deployments) and PostgreSQL (for production multi-instance deployments).
 - **CORS Policy**: Configurable origin allowlisting (`CORS_ORIGIN` / `CORS_ALLOWED_ORIGINS`) with secure default-deny in production.
 - **Per-IP Rate Limiting**: Built-in fixed-window rate limiting responding with HTTP `429 Too Many Requests` and `Retry-After` headers.
+- **Claim Lifecycle Webhooks**: Authenticated wallet/claim-type subscriptions receive signed revocation and expiry notifications with durable retry state.
 - **Zero Identity Exposure**: Ingests and stores only public on-chain commitments and verification metadata. No user identity fields are stored or processed.
+- **On-chain data integrity**: Periodically re-reads a rotating sample of indexed claims out of `ProofRegistry` and reports any drift as a Prometheus metric, so event-derived state can be checked against the contracts it was derived from instead of being trusted blindly.
 
 ---
 
@@ -47,7 +49,8 @@ To prevent scraping and denial-of-service, all HTTP endpoints are protected by p
 
 ## HTTP API Endpoints
 
-All responses are JSON. Only `GET` and `OPTIONS` methods are supported (no write endpoints).
+Responses are JSON unless noted otherwise. Read endpoints are public by default;
+administrative writes and webhook subscription management require `API_KEY`.
 
 ### 1. `GET /health`
 Returns the operational health of the indexer and the last processed ledger sequence.
@@ -72,11 +75,15 @@ Retrieves all recorded credential claims (active and revoked) for a Stellar wall
       "expiry": 1755000000,
       "ledger_sequence": 1234560,
       "threshold": null,
-      "revoked": 0
+      "revoked": 0,
+      "expired": false,
+      "state": "active"
     }
   ]
 }
 ```
+
+`expired` and `state` are **derived**, not event-sourced — the contract emits no expiry event, so the indexer evaluates `expiry <= now` itself. See [Expiry semantics](#expiry-semantics--the-documented-guarantee) for exactly what that does and does not guarantee, and treat `state: "active"` as "not revoked and not past the indexed expiry" rather than as proof the claim still validates.
 
 ### 3. `GET /stats`
 Returns aggregated claim counts grouped by credential type.
@@ -111,6 +118,22 @@ the first page; a `null` `nextCursor` means there are no more claims. `limit`
 }
 ```
 
+### Real-time claim subscriptions (`#392`)
+
+The `/recent` feed and `/claims?wallet=` snapshot are the two endpoints the
+SDK's `subscribeClaims()` helper (`@stellarcred/sdk`, see
+[frontend/packages/sdk/README.md](../../frontend/packages/sdk/README.md))
+composes into a push subscription: it tails `/recent` once per poll for
+`gained` events (keyset cursor over `nextCursor`), and periodically re-reads
+`/claims?wallet=` to reconcile `revoked` flags into `lost` events. Protocols
+can therefore build their own feeds from the same pair without touching
+Soroban RPC, or call the helper directly.
+
+Because every subscription tick costs one `/recent` call plus one `/claims`
+call per wallet per `resyncMs`, size `RATE_LIMIT_MAX` for the expected
+`watched-wallets / resync-interval` request rate when serving many
+subscribers.
+
 ---
 
 ## Environment Variables
@@ -130,6 +153,11 @@ the first page; a `null` `nextCursor` means there are no more claims. `limit`
 | `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window duration | `60` |
 | `RATE_LIMIT_MAX` | Max requests per IP per window | `120` |
 | `RATE_LIMIT_ENABLED` | Enable or disable rate limiting (`true`/`false`) | `true` |
+| `WEBHOOK_SIGNING_SECRET` | HMAC-SHA256 secret for lifecycle webhook delivery (minimum 32 characters) | — |
+| `API_KEY` | Required to manage webhook subscriptions; also gates protected read endpoints | — |
+| `INTEGRITY_CHECK_ENABLED` | Periodically verify sampled claims against on-chain contract state (`true`/`false`) | `true` |
+| `INTEGRITY_CHECK_INTERVAL_SECONDS` | Seconds between on-chain verification passes | `900` |
+| `INTEGRITY_CHECK_SAMPLE_SIZE` | Claims compared against contract state per pass | `25` |
 
 ---
 
@@ -196,11 +224,200 @@ strings) — running it on both is how we keep either backend from rotting.
 
 ---
 
+## Protocol claim lifecycle webhooks
+
+Protocols with ongoing access should **gate each request using the live
+`hasClaim`/on-chain check, then reconcile their existing access state when a
+revocation or expiry notification arrives**. Neither is sufficient alone:
+request-time checks prevent stale grants at the next request, while webhook
+notifications let a protocol proactively close sessions, positions, or
+subscriptions that are already active.
+
+The indexer queues notifications for one exact `(wallet, claimType)` pair.
+Issuer revocations are detected from indexed ProofRegistry events; expiry is
+detected by the regular indexer poll once `expiry <= now`. Delivery is
+asynchronous and eventual, with a delay bounded by the configured polling
+interval, finality lag, and delivery retries. The upgraded ProofRegistry also
+emits an event for holder self-revocation; deployments on older contract
+versions must upgrade before those revocations can generate notifications.
+The normal request-time on-chain check remains necessary.
+
+Set both `API_KEY` and a random `WEBHOOK_SIGNING_SECRET` of at least 32
+characters before registering subscriptions. The API key protects subscription
+management. The webhook secret signs deliveries and is never returned by the
+API; configure the same secret in the receiver's secret manager and never
+expose it in a browser/client. Subscription URLs must use HTTPS and resolve
+only to public IP addresses.
+
+### Manage subscriptions
+
+All routes below require `Authorization: Bearer <API_KEY>` or `X-API-Key`.
+Subscriptions are specific to one wallet and claim type; create one per pair
+the protocol relies on.
+
+```http
+POST /webhooks/subscriptions
+Content-Type: application/json
+
+{
+  "url": "https://protocol.example/stellarcred/events",
+  "wallet": "G...",
+  "claimType": "kyc"
+}
+```
+
+The response is `{ "id": 12, "wallet": "G...", "claimType": "kyc" }`.
+Repeated registration of the same URL/wallet/type is idempotent. List with
+`GET /webhooks/subscriptions?wallet=G...`, inspect recent attempts with
+`GET /webhooks/subscriptions/:id/deliveries`, and remove a subscription with
+`DELETE /webhooks/subscriptions/:id`. Removing a subscription does not cancel
+deliveries already queued for it.
+
+### Event payload and signature
+
+The indexer sends `claim.revoked` or `claim.expired` JSON payloads:
+
+```json
+{
+  "eventId": "revoked:...",
+  "type": "claim.revoked",
+  "wallet": "G...",
+  "claimType": "kyc",
+  "expiry": 1755000000,
+  "ledgerSequence": 1234560,
+  "occurredAt": 1724000000,
+  "reasonCode": "issuer_revoked"
+}
+```
+
+For expiry, `type` is `claim.expired`, `occurredAt` is the credential expiry,
+and `reasonCode` is `credential_expired`. Delivery includes
+`X-StellarCred-Timestamp` (Unix seconds) and
+`X-StellarCred-Signature: sha256=<hex>`. Verify it as HMAC-SHA256 over
+`<timestamp>.<raw request body>` with `WEBHOOK_SIGNING_SECRET`, compare
+signatures in constant time, and reject stale timestamps. Use `eventId` for
+idempotency: successful delivery is at-least-once, not exactly-once.
+Unsuccessful attempts retry with exponential backoff (5 seconds, doubling up
+to one hour) for at most eight attempts. Inspect delivery history and reconcile
+from the chain if retries are exhausted.
+
+---
+
 ## Consistency, Finality & Reorg Guarantees
 
 - **Cursor Progression**: The indexer stores the last successfully processed ledger sequence in database metadata. In the event of a restart, ingestion resumes seamlessly from the saved checkpoint without skipping events.
 - **Idempotency**: Ingested events and claim records are keyed by `(contract_id, topic, ledger_sequence, tx_hash)`, making replays and repeated ingestion fully idempotent.
 - **Finality**: Stellar consensus achieves deterministic single-slot finality (~5 seconds per ledger). By polling confirmed ledgers via Soroban RPC `getEvents`, the indexer avoids unconfirmed/mempool race conditions.
+- **Verified Against Chain State**: The guarantees above are about the *indexing pipeline*, and none of them prove the derived table still agrees with the contracts. That is checked separately and continuously — see [On-chain data integrity](#on-chain-data-integrity) below.
+
+---
+
+## On-chain data integrity
+
+Everything in the `claims` table is *derived*: it is rebuilt from contract events and never read back from the contract. The finality lag and reorg reconciliation above keep ingestion honest, but they cannot catch every way the derived state can drift:
+
+- an event missed during a Horizon/Soroban RPC outage,
+- a bug in event decoding that writes a plausible-looking but wrong `expiry` or `issuer`,
+- a reorg the reconcile path handled imperfectly — it deletes rows *above* the reorg point, but a row written *below* it from a fork that won is not reachable by that rollback,
+- a revoke that happened in a transaction whose event the indexer never saw.
+
+So the indexer periodically re-reads a sample of its own claims out of contract state and reports every disagreement.
+
+### How it works
+
+1. **Sample.** `sampleClaimsForVerification` returns the next `INTEGRITY_CHECK_SAMPLE_SIZE` claims past a durable cursor in `data_integrity_state`, topping the slice back up from the start when it runs off the end. Successive passes therefore sweep the whole table rather than re-verifying the same head rows forever.
+2. **Read.** Each sampled claim's `(wallet, credential_type)` is read from `ProofRegistry` over Soroban RPC `getLedgerEntries`, which returns the stored `ProofRecord` — the same durable entry `is_verified` / `get_record` read. No simulated transaction or submitted authorization is involved.
+3. **Compare.** The indexed row is compared field-by-field against the record, and each disagreement is reported as a typed mismatch.
+4. **Report.** Mismatch counts are published as metrics, and the full detail is available over HTTP.
+
+The expiry decision uses the **chain's own clock** (the newest closed ledger's timestamp), not the host's, so it stays correct on a machine whose wall clock has drifted.
+
+### Mismatch kinds
+
+| Kind | Meaning |
+|---|---|
+| `missing_on_chain` | The indexer serves a live claim the contract has no record of — a missed event, or a reorg the rollback could not reach. |
+| `revoked_on_chain` | The contract's record is `revoked` but the indexer never saw the revoke event. |
+| `revoked_in_index` | The indexer says revoked but the contract's record is not — an over-eager reconcile or rollback. |
+| `expiry_mismatch` / `verified_at_mismatch` | The indexed timestamp differs from the stored one — a decoding bug, or stale data from a fork. |
+| `threshold_mismatch` / `issuer_mismatch` | The indexed value differs from the stored one. |
+
+### Metrics and alerting
+
+Published on `/metrics` alongside the existing indexer series:
+
+| Metric | Type | Use |
+|---|---|---|
+| `indexer_state_mismatches` | gauge | **The alerting series.** Claims that disagreed with the contract in the last completed pass. |
+| `indexer_state_checked` | gauge | Claims compared in the last completed pass. |
+| `indexer_state_mismatches_total` | counter | Cumulative mismatches. Alert on `rate()` of this, not on `indexer_state_mismatches` directly. |
+| `indexer_state_mismatches_by_kind{kind="…"}` | counter | Per-kind breakdown, for routing a decoding bug differently from a missed revocation. |
+| `indexer_state_checks_total` | counter | Passes run. |
+| `indexer_state_checks_incomplete_total` | counter | Passes in which at least one sampled claim could not be read. |
+| `indexer_state_check_errors` | gauge | Unreadable claims in the last pass. |
+| `indexer_state_last_check_timestamp_seconds` | gauge | When the last pass finished; `0` if none has. |
+| `indexer_state_last_success_timestamp_seconds` | gauge | When the last pass read *every* sampled claim. |
+| `indexer_state_last_check_duration_seconds` | gauge | Duration of the last pass. |
+
+Alert on `indexer_state_mismatches > 0` sustained over a few passes, and separately on a stale `indexer_state_last_success_timestamp_seconds`.
+
+**A read failure is never counted as a mismatch.** Only claims the contract actually answered for can produce one; unreadable claims move `indexer_state_check_errors` and mark the pass incomplete. Without this split an RPC outage would fire the data-integrity alarm for an infrastructure problem, and the signal would stop being trustworthy.
+
+### Running it
+
+On demand:
+
+```http
+GET /integrity/status
+```
+Operational metadata — when the last pass ran, whether it read everything, and the most recent mismatches with full detail. Public, like `/health`.
+
+```http
+POST /integrity/check[?sampleSize=25]
+```
+Runs a pass immediately and returns its report. Gated by `API_KEY` when one is configured: each call costs one RPC read per sampled claim *and* advances the rotating cursor, so an unauthenticated caller could both exhaust the RPC quota and starve the periodic sweep. Overlapping calls share the in-flight pass rather than running concurrently.
+
+`POST /integrity/check` returns:
+
+```json
+{
+  "checked": 25,
+  "unreadable": 0,
+  "mismatchCount": 1,
+  "complete": true,
+  "durationSeconds": 0.42,
+  "mismatches": [
+    {
+      "wallet": "G…",
+      "credential_type": "kyc",
+      "ledger_sequence": 1234560,
+      "kinds": ["revoked_on_chain"],
+      "indexed": { "revoked": 0, "expiry": 1755000000, "verified_at": 1724000000, "threshold": null, "issuer": "GISSUER…" },
+      "chain":  { "revoked": true, "expiry": 1755000000, "verifiedAt": 1724000000, "threshold": null, "issuer": "GISSUER…" }
+    }
+  ]
+}
+```
+
+Note that the checker **reports** drift; it does not repair it. Remediation is a reindex (`START_LEDGER` rewind) or a manual reconcile once the cause is known.
+
+### Expiry semantics — the documented guarantee
+
+`ProofRegistry` enforces expiry **lazily, at read time**:
+
+```
+is_verified => valid = !revoked && expiry > ledger.timestamp()
+```
+
+Three consequences pin down what the indexer may claim:
+
+1. **Expiry emits no event, so the indexer does not fold it into `revoked`.** There is no `expired` topic. `revoked` therefore keeps a single, narrow meaning — *the issuer or holder revoked this claim on-chain* — and is a faithful mirror of the stored `ProofRecord.revoked` flag. Mixing in time-based expiry would conflate two different facts and make "did we see the revoke event?" unanswerable.
+2. **The indexer computes expiry itself, from indexed data.** Every claim row carries the `expiry` timestamp from the `submitted` event, so the indexer evaluates `expiry <= now` and surfaces the result as derived `expired` / `state` fields on `/claims` and `/recent`. This is exact — the timestamp is indexed data, not a guess — and it matches the contract's strict comparison (`expiry == now` is already expired, because `is_verified` requires `expiry > timestamp`). `state` is `"revoked"`, then `"expired"`, then `"active"`.
+3. **An expired claim still needs a live chain check to be authoritative.** The contract TTL-bumps the persistent entry up to its `expiry` (`ProofRegistry::bump_ttl`), so once expiry elapses the entry can be evicted from contract state entirely and `get_record` returns `None`. At that point the chain can no longer confirm anything about the claim, and only the fact that it *was* issued survives — on-chain, nowhere.
+
+**What this means for you as a consumer.** Use the indexer to list and to pre-filter, and use it as a cache for claims the chain still holds state for. For a claim the indexer reports as `state: "expired"`, make the live `is_verified` / `check_claim` call before acting — as the existing request-time on-chain check guidance above already says. Do not read `state: "active"` as proof the claim still validates; it means "not revoked and not past the indexed expiry", which is the strongest statement event-derived state can support.
+
+**And for the checker itself**: a claim missing from contract storage counts as `missing_on_chain` only when it is *not* locally expired. A missing entry for an expired claim is the expected steady state, not drift — otherwise this alert would fire forever on every claim that has simply aged out.
 
 ---
 

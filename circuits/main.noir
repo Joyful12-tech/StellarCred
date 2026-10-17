@@ -1,0 +1,20 @@
+// circuits/src/main.noir
+use dep::std;
+
+fn main(
+    // Private inputs
+    secret: Field,
+    credential_salt: Field,
+    // Public inputs
+    context_id: pub Field,
+    merkle_root: pub Field,
+) -> pub Field {
+    // 1. Verify credential membership (existing logic mock)
+    // ...
+
+    // 2. Derive deterministic per-context nullifier: Poseidon2([secret, context_id], 2)
+    let nullifier = std::hash::poseidon::bn254::hash_2([secret, context_id]);
+
+    // Return or output nullifier as a public input
+    nullifier
+}

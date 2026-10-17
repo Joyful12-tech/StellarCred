@@ -41,7 +41,10 @@ const ENV_KEYS = [
   "NEXT_PUBLIC_ISSUER_ADDRESS",
   "PERSONA_API_KEY",
   "PERSONA_KYC_TEMPLATE_ID",
+  "PLAID_CLIENT_ID",
+  "PLAID_SECRET",
   "PLAID_ACCESS_TOKEN",
+  "PLAID_ACCESS_TOKENS",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -65,10 +68,10 @@ async function loadRoute() {
   return import("../route");
 }
 
-function postRequest(body: unknown) {
+function postRequest(body: unknown, headers: Record<string, string> = {}) {
   return new NextRequest("http://localhost/api/issue", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -112,6 +115,143 @@ describe("signature correctness", () => {
     const sig = Uint8Array.from(credential.sig);
 
     expect(secp256k1.verify(sig, digest, pubkey, { prehash: false })).toBe(true);
+  });
+});
+
+describe("funds issuance (aggregate proof-of-funds)", () => {
+  function plaidItemResponse(accounts: unknown[]) {
+    return { ok: true, json: async () => ({ accounts }) };
+  }
+
+  // Env validation requires client id, secret, and a token to be set
+  // together, so every aggregation test configures the full Plaid triple.
+  function setPlaidEnv(tokens: string) {
+    delete process.env.PLAID_ACCESS_TOKEN;
+    process.env.PLAID_CLIENT_ID = "test-plaid-client-id";
+    process.env.PLAID_SECRET = "test-plaid-secret";
+    process.env.PLAID_ACCESS_TOKENS = tokens;
+  }
+
+  it("overwrites a user-supplied balance with the aggregate summed across linked Plaid items", async () => {
+    delete process.env.ISSUER_PRIVATE_KEY;
+    setPlaidEnv("item-a,item-b");
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          plaidItemResponse([
+            { type: "depository", name: "Checking", balances: { available: 1500 } },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          plaidItemResponse([
+            { type: "depository", name: "Savings", balances: { available: 25000 } },
+          ]),
+        ),
+    );
+
+    const { POST } = await loadRoute();
+
+    const res = await POST(
+      postRequest({
+        credential_types: ["funds"],
+        holder: HOLDER,
+        issuerId: ISSUER_ID,
+        // User-supplied figure — Plaid's verified aggregate must win.
+        attributes: { balance: "1" },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const { credentials } = await res.json();
+    expect(credentials).toHaveLength(1);
+    expect(credentials[0].type).toBe("funds");
+    expect(credentials[0].value).toBe("26500");
+  });
+
+  it("fails closed when any linked item errors instead of attesting a partial sum", async () => {
+    delete process.env.ISSUER_PRIVATE_KEY;
+    setPlaidEnv("item-a,item-broken");
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          plaidItemResponse([
+            { type: "depository", name: "Checking", balances: { available: 90000 } },
+          ]),
+        )
+        .mockResolvedValueOnce({
+          ok: false,
+          json: async () => ({ error_code: "ITEM_LOGIN_REQUIRED" }),
+        }),
+    );
+
+    const { POST } = await loadRoute();
+
+    const res = await POST(
+      postRequest({
+        credential_types: ["funds"],
+        holder: HOLDER,
+        issuerId: ISSUER_ID,
+      }),
+    );
+
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.code).toBe("PLAID_ERROR");
+  });
+
+  it("attests only the aggregate — per-source account data never reaches the credential or the logs", async () => {
+    delete process.env.ISSUER_PRIVATE_KEY;
+    setPlaidEnv("item-a,item-b");
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          plaidItemResponse([
+            { type: "depository", name: "Acme Checking", balances: { available: 1200 } },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          plaidItemResponse([
+            { type: "depository", name: "Acme Savings", balances: { available: 8800 } },
+          ]),
+        ),
+    );
+
+    const { POST } = await loadRoute();
+    // Imported after loadRoute()'s vi.resetModules() so this resolves to the
+    // same fresh logger instance route.ts itself just imported.
+    const { logger } = await import("@/lib/logger");
+    const infoSpy = vi.spyOn(logger, "info");
+    const warnSpy = vi.spyOn(logger, "warn");
+    const errorSpy = vi.spyOn(logger, "error");
+
+    const res = await POST(
+      postRequest({
+        credential_types: ["funds"],
+        holder: HOLDER,
+        issuerId: ISSUER_ID,
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const { credentials } = await res.json();
+    // The aggregate (10000) is attested; component names/balances stay private.
+    expect(credentials).toHaveLength(1);
+    expect(credentials[0].value).toBe("10000");
+    expect(credentials[0].accounts).toBeUndefined();
+    expect(credentials[0].sources).toBeUndefined();
+
+    for (const spy of [infoSpy, warnSpy, errorSpy]) {
+      for (const call of spy.mock.calls) {
+        const logged = JSON.stringify(call);
+        expect(logged).not.toMatch(/Acme|item-a|item-b/);
+      }
+    }
   });
 });
 
@@ -178,6 +318,143 @@ describe("validation", () => {
 
     const res = await POST(postRequest({ type: "kyc", issuerId: ISSUER_ID }));
     expect(res.status).toBe(400);
+  });
+});
+
+describe("idempotency", () => {
+  it("replays completed issuance with a redacted marker and stores no credential material", async () => {
+    delete process.env.ISSUER_PRIVATE_KEY;
+    const { POST } = await loadRoute();
+    const { idempotencyGet } = await import("@/lib/idempotency");
+    const { IssuerClient } = await import("@stellarcred/issuer");
+    const issueSpy = vi.spyOn(IssuerClient.prototype, "issue");
+    const key = "issue-redacted-replay";
+    const body = {
+      credential_types: ["age"],
+      holder: HOLDER,
+      issuerId: ISSUER_ID,
+      attributes: { date_of_birth: "1995-06-15" },
+    };
+
+    const first = await POST(
+      postRequest(body, { "Idempotency-Key": key }),
+    );
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({
+      credentials: [expect.objectContaining({ type: "age" })],
+    });
+    expect(issueSpy).toHaveBeenCalledTimes(1);
+
+    const serializedRecord = JSON.stringify(idempotencyGet(key));
+    expect(serializedRecord).toContain('"kind":"completed"');
+    for (const prohibited of [
+      "1995-06-15",
+      "credentials",
+      "value",
+      "salt",
+      "commitment",
+      "sig",
+    ]) {
+      expect(serializedRecord).not.toContain(prohibited);
+    }
+
+    const replay = await POST(
+      postRequest(body, { "Idempotency-Key": key }),
+    );
+    expect(replay.status).toBe(409);
+    expect(replay.headers.get("X-Idempotent")).toBe("true");
+    expect(replay.headers.get("X-Idempotency-Replay")).toBe("redacted");
+    await expect(replay.json()).resolves.toMatchObject({
+      code: "IDEMPOTENCY_RESPONSE_REDACTED",
+    });
+    expect(issueSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays a Persona redirect without retaining request attributes", async () => {
+    delete process.env.ISSUER_PRIVATE_KEY;
+    process.env.PERSONA_API_KEY = "test-persona-key";
+    process.env.PERSONA_KYC_TEMPLATE_ID = "itmpl_test";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { id: "inq_idempotency" } }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { POST } = await loadRoute();
+    const { idempotencyGet } = await import("@/lib/idempotency");
+    const key = "persona-redirect-replay";
+    const body = {
+      credential_types: ["kyc"],
+      holder: HOLDER,
+      issuerId: ISSUER_ID,
+      attributes: { date_of_birth: "1995-06-15" },
+    };
+
+    const first = await POST(
+      postRequest(body, { "Idempotency-Key": key }),
+    );
+    expect(first.status).toBe(202);
+    const firstBody = await first.json();
+    expect(firstBody).toMatchObject({
+      needsPersona: true,
+      inquiryId: "inq_idempotency",
+    });
+
+    const serializedRecord = JSON.stringify(idempotencyGet(key));
+    expect(serializedRecord).toContain('"kind":"persona_pending"');
+    expect(serializedRecord).not.toContain("attributes");
+    expect(serializedRecord).not.toContain("date_of_birth");
+    expect(serializedRecord).not.toContain("1995-06-15");
+
+    const replay = await POST(
+      postRequest(body, { "Idempotency-Key": key }),
+    );
+    expect(replay.status).toBe(202);
+    expect(replay.headers.get("X-Idempotent")).toBe("true");
+    await expect(replay.json()).resolves.toEqual(firstBody);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps simultaneous retries single-flight after a failed leader", async () => {
+    delete process.env.ISSUER_PRIVATE_KEY;
+    const { POST } = await loadRoute();
+    const { IssuerClient } = await import("@stellarcred/issuer");
+    let signalFirstIssueStarted!: () => void;
+    const firstIssueStarted = new Promise<void>((resolve) => {
+      signalFirstIssueStarted = resolve;
+    });
+    let rejectFirstIssue!: (reason?: unknown) => void;
+    const firstIssue = new Promise<never>((_resolve, reject) => {
+      rejectFirstIssue = reject;
+    });
+    const issueSpy = vi
+      .spyOn(IssuerClient.prototype, "issue")
+      .mockImplementationOnce(async () => {
+        signalFirstIssueStarted();
+        return firstIssue;
+      });
+    const body = {
+      credential_types: ["age"],
+      holder: HOLDER,
+      issuerId: ISSUER_ID,
+      attributes: { date_of_birth: "1995-06-15" },
+    };
+    const headers = { "Idempotency-Key": "failed-leader-retry" };
+
+    const leader = POST(postRequest(body, headers));
+    await firstIssueStarted;
+    const duplicateOne = POST(postRequest(body, headers));
+    const duplicateTwo = POST(postRequest(body, headers));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    rejectFirstIssue(new Error("leader failed"));
+
+    const responses = await Promise.all([leader, duplicateOne, duplicateTwo]);
+    expect(responses.map((response) => response.status).sort()).toEqual([
+      200,
+      409,
+      500,
+    ]);
+    expect(issueSpy).toHaveBeenCalledTimes(2);
   });
 });
 

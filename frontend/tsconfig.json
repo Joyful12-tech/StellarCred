@@ -16,7 +16,7 @@
     "plugins": [{ "name": "next" }],
     "paths": {
       "@/*": ["./*"],
-      "@stellarcred/sdk": ["./packages/sdk/index.ts"]
+      "@stellarcred/sdk": ["./packages/sdk/src/index.ts"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
@@ -27,6 +27,7 @@
     // so its vitest config/tests would fail to resolve here. Exclude them from
     // the app typecheck; they are typechecked by the SDK's own toolchain.
     "packages/sdk/test",
+    "packages/sdk/dist",
     "packages/sdk/vitest.config.ts",
     // Node built-in test runner suite (pnpm test:theme), not part of app tsc.
     "lib/theme.test.ts"

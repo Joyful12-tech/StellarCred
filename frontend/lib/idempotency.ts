@@ -1,35 +1,50 @@
+import { createHash } from "node:crypto";
+import { getSharedStore, checkMultiInstanceStoreWarning } from "./shared-store";
+
 /**
- * In-memory idempotency store for the /api/issue endpoint.
+ * Idempotency records for issuance endpoints.
  *
- * Design:
- * - Stores opaque key → serialized response (status, body, headers) with a TTL.
- * - The key is an opaque ID from the `Idempotency-Key` header; the store itself
- *   tracks no identity fields (no userId, no walletAddress, no PII).
- * - Keys are validated before use (non-empty, printable, ≤ MAX_KEY_LENGTH_BYTES)
- *   so a hostile oversized header cannot cause memory amplification.
- * - Expired entries are lazily purged on access and periodically during sets.
- * - An in-flight sentinel de-duplicates *concurrent* requests that share the
- *   same key: the first request becomes the leader and any duplicate that
- *   arrives while it is still running awaits its result instead of re-executing
- *   external provider calls (Persona, Plaid) or signing.
+ * Privacy and retention:
+ * - Completed issuance is represented only by a SHA-256 response hash and a
+ *   completion marker. Response bodies, headers, credentials, commitments,
+ *   salts, and attribute values are never cached.
+ * - Persona redirects retain only the inquiry ID and provider URL needed to
+ *   resume that redirect; no request attributes are retained.
+ * - Records expire after IDEMPOTENCY_TTL_SECONDS (60 seconds by default). This
+ *   is the maximum persistence window in either the in-process Map or a shared
+ *   store such as Redis. Keep the TTL short when configuring a shared store.
+ *   During rollout, purge existing `idem:*` shared-store entries from versions
+ *   that stored full responses; a legacy record is scrubbed when it is read.
+ * - The response necessarily exists while an issuance request is running and
+ *   is returned to its caller, but it is not retained for retry replay. A
+ *   retried completed issuance receives a redacted marker instead.
  *
  * Scope / known limitation:
- * - This is an in-process store. It guarantees at-most-once execution within a
- *   single server instance/process. In a horizontally scaled deployment with
- *   multiple replicas (Kubernetes, ECS, Vercel serverless concurrency, …), a
- *   retry that is load-balanced to a different replica will not hit this store,
- *   so the same request could execute there too. Meeting that stronger
- *   cross-replica guarantee would require a shared external store (e.g. Redis
- *   with SET NX PX). The short TTL (default 60s) keeps this window bounded.
- * - Server restart naturally clears all entries.
+ * - The in-flight sentinel de-duplicates only within one server instance.
+ *   A shared store prevents re-execution after a completed request, but an
+ *   atomic distributed lock is still needed to deduplicate simultaneous
+ *   requests on separate replicas.
+ * - Server restart clears local records.
  */
 
-export interface CachedResponse {
-  status: number;
-  body: string; // JSON-stringified response body
-  headers: Record<string, string>;
-  createdAt: number; // Date.now() timestamp
+export interface CompletedIdempotencyRecord {
+  version: 1;
+  kind: "completed";
+  responseHash: string;
+  createdAt: number;
 }
+
+export interface PersonaPendingIdempotencyRecord {
+  version: 1;
+  kind: "persona_pending";
+  inquiryId: string;
+  personaUrl: string;
+  createdAt: number;
+}
+
+export type IdempotencyRecord =
+  | CompletedIdempotencyRecord
+  | PersonaPendingIdempotencyRecord;
 
 /**
  * Maximum accepted Idempotency-Key length in bytes. Guards against memory
@@ -49,6 +64,11 @@ function ttlMs(): number {
   return DEFAULT_TTL_SECONDS * 1000;
 }
 
+function remainingTtlSeconds(createdAt: number): number {
+  const remaining = ttlMs() - (Date.now() - createdAt);
+  return Math.max(1, Math.ceil(remaining / 1000));
+}
+
 /**
  * Validate an Idempotency-Key before it is used to read or write the store.
  *
@@ -62,26 +82,158 @@ export function isValidIdempotencyKey(key: string): boolean {
   if (new TextEncoder().encode(key).length > MAX_KEY_LENGTH_BYTES) return false;
   for (let i = 0; i < key.length; i++) {
     const code = key.charCodeAt(i);
-    // C0 control chars + DEL are rejected; everything else (incl. printable
-    // unicode) is fine and still bounded by the byte-length cap above.
     if (code < 0x20 || code === 0x7f) return false;
   }
   return true;
 }
 
-const store = new Map<string, CachedResponse>();
+export function completedIdempotencyRecord(
+  status: number,
+  body: string,
+): CompletedIdempotencyRecord {
+  return {
+    version: 1,
+    kind: "completed",
+    responseHash: createHash("sha256")
+      .update(String(status))
+      .update("\n")
+      .update(body)
+      .digest("hex"),
+    createdAt: Date.now(),
+  };
+}
+
+export function personaPendingIdempotencyRecord(
+  inquiryId: string,
+  personaUrl: string,
+): PersonaPendingIdempotencyRecord {
+  return {
+    version: 1,
+    kind: "persona_pending",
+    inquiryId,
+    personaUrl,
+    createdAt: Date.now(),
+  };
+}
+
+const store = new Map<string, IdempotencyRecord>();
 
 /**
- * Retrieve a cached response by idempotency key.
- * Returns `null` if the key is not found, invalid, or the entry has expired.
+ * Hard cap on stored records. The lazy every-100-sets cleanup only drops
+ * entries whose TTL has already elapsed; a flood of distinct in-TTL keys
+ * would therefore grow the map without bound. This cap closes that gap.
  */
-export function idempotencyGet(key: string): CachedResponse | null {
+function maxEntries(): number {
+  const env = process.env.IDEMPOTENCY_MAX_ENTRIES;
+  if (env) {
+    const parsed = parseInt(env, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 10_000;
+}
+
+function enforceCap(): void {
+  const cap = maxEntries();
+  if (store.size <= cap) return;
+  let removed = store.size - cap;
+  for (const key of store.keys()) {
+    store.delete(key);
+    if (--removed <= 0) break;
+  }
+}
+
+function isExpired(record: IdempotencyRecord): boolean {
+  return Date.now() - record.createdAt > ttlMs();
+}
+
+function parseStoredRecord(raw: string): {
+  record: IdempotencyRecord;
+  legacy: boolean;
+} | null {
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const value = parsed as Record<string, unknown>;
+  if (typeof value.createdAt !== "number") return null;
+
+  if (
+    value.version === 1 &&
+    value.kind === "completed" &&
+    typeof value.responseHash === "string"
+  ) {
+    return {
+      record: {
+        version: 1,
+        kind: "completed",
+        responseHash: value.responseHash,
+        createdAt: value.createdAt,
+      },
+      legacy: false,
+    };
+  }
+
+  if (
+    value.version === 1 &&
+    value.kind === "persona_pending" &&
+    typeof value.inquiryId === "string" &&
+    typeof value.personaUrl === "string"
+  ) {
+    return {
+      record: {
+        version: 1,
+        kind: "persona_pending",
+        inquiryId: value.inquiryId,
+        personaUrl: value.personaUrl,
+        createdAt: value.createdAt,
+      },
+      legacy: false,
+    };
+  }
+
+  if (typeof value.body === "string") {
+    const status = typeof value.status === "number" ? value.status : 200;
+    return {
+      record: {
+        ...completedIdempotencyRecord(status, value.body),
+        createdAt: value.createdAt,
+      },
+      legacy: true,
+    };
+  }
+
+  return null;
+}
+
+function persistLocal(key: string, record: IdempotencyRecord): void {
+  store.set(key, record);
+
+  if (store.size >= 100 && store.size % 100 === 0) {
+    idempotencyCleanup();
+  }
+  enforceCap();
+}
+
+async function persistShared(
+  key: string,
+  record: IdempotencyRecord,
+): Promise<void> {
+  await getSharedStore()
+    .set(`idem:${key}`, JSON.stringify(record), remainingTtlSeconds(record.createdAt))
+    .catch(() => null);
+}
+
+/**
+ * Retrieve an idempotency record by key from this process.
+ * Returns `null` if the key is not found, invalid, or expired.
+ */
+export function idempotencyGet(key: string): IdempotencyRecord | null {
+  checkMultiInstanceStoreWarning();
   if (!isValidIdempotencyKey(key)) return null;
 
   const entry = store.get(key);
   if (!entry) return null;
 
-  if (Date.now() - entry.createdAt > ttlMs()) {
+  if (isExpired(entry)) {
     store.delete(key);
     return null;
   }
@@ -90,48 +242,85 @@ export function idempotencyGet(key: string): CachedResponse | null {
 }
 
 /**
- * Store a response under an idempotency key with the current timestamp.
- * Invalid keys (empty, oversized, control chars) are silently ignored.
+ * Retrieve an idempotency record from the configured shared store.
+ * Legacy full-response records are immediately overwritten with a redacted
+ * completion marker and are never replayed.
  */
-export function idempotencySet(key: string, response: CachedResponse): void {
-  if (!isValidIdempotencyKey(key)) return;
+export async function idempotencyGetAsync(
+  key: string,
+): Promise<IdempotencyRecord | null> {
+  checkMultiInstanceStoreWarning();
+  if (!isValidIdempotencyKey(key)) return null;
 
-  store.set(key, response);
+  const local = idempotencyGet(key);
+  if (local) return local;
 
-  // Lazy cleanup: purge all expired entries every 100 new keys to avoid
-  // unbounded growth. Skip on the very first set (size 0 would also match).
-  if (store.size >= 100 && store.size % 100 === 0) {
-    idempotencyCleanup();
+  try {
+    const raw = await getSharedStore().get(`idem:${key}`);
+    if (!raw) return null;
+
+    const parsed = parseStoredRecord(raw);
+    if (!parsed) return null;
+    if (isExpired(parsed.record)) {
+      await getSharedStore().del(`idem:${key}`).catch(() => null);
+      return null;
+    }
+
+    persistLocal(key, parsed.record);
+    if (parsed.legacy) await persistShared(key, parsed.record);
+    return parsed.record;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Remove all expired entries from the store.
+ * Store a minimal idempotency record under a key. Invalid keys are ignored.
+ */
+export function idempotencySet(key: string, record: IdempotencyRecord): void {
+  if (!isValidIdempotencyKey(key)) return;
+
+  persistLocal(key, record);
+  void persistShared(key, record);
+}
+
+/**
+ * Store a minimal idempotency record in the configured shared store.
+ */
+export async function idempotencySetAsync(
+  key: string,
+  record: IdempotencyRecord,
+): Promise<void> {
+  if (!isValidIdempotencyKey(key)) return;
+
+  persistLocal(key, record);
+  await persistShared(key, record);
+}
+
+/**
+ * Remove all expired entries from the local store.
  * Useful for testing and periodic maintenance.
  */
 export function idempotencyCleanup(): void {
-  const now = Date.now();
-  const ttl = ttlMs();
   for (const [key, entry] of store) {
-    if (now - entry.createdAt > ttl) {
+    if (isExpired(entry)) {
       store.delete(key);
     }
   }
-  // Also release stale in-flight slots (crashed or over-TTL leaders) so a
-  // dead request can never block retries forever.
-  pruneStaleInFlight(now, ttl);
+  pruneStaleInFlight(Date.now(), ttlMs());
 }
 
 /**
- * Clear the entire store. Only exposed for testing.
+ * Clear the entire local store. Only exposed for testing.
  */
 export function idempotencyClear(): void {
   store.clear();
   inFlight.clear();
+  getSharedStore().clear?.();
 }
 
 /**
- * Return the number of entries in the store. Only exposed for testing.
+ * Return the number of local entries. Only exposed for testing.
  */
 export function idempotencySize(): number {
   return store.size;
@@ -143,8 +332,8 @@ export function idempotencySize(): number {
 
 interface InFlightEntry {
   startedAt: number;
-  promise: Promise<CachedResponse>;
-  resolve: (response: CachedResponse) => void;
+  promise: Promise<IdempotencyRecord>;
+  resolve: (record: IdempotencyRecord) => void;
   reject: (error: unknown) => void;
 }
 
@@ -166,43 +355,28 @@ function pruneStaleInFlight(now: number, ttl: number): void {
 /**
  * Begin — or join — an in-flight slot for `key`.
  *
- * - Returns `null` when the caller should proceed as the leader: no other
- *   request with this key is currently executing. The leader MUST call
- *   `idempotencyInFlightSettle` (or `idempotencyInFlightFail`) once it has a
- *   result so waiting duplicates can be released.
- * - Returns a Promise when a request with the same key is already executing.
- *   The caller should await that promise and replay the produced response
- *   instead of re-executing the request.
- *
- * Stale slots (a leader that crashed without settling) are pruned after the
- * TTL so a dead request can never block retries forever.
+ * The slot resolves only with a minimal idempotency record. Concurrent
+ * duplicates therefore receive the same redacted retry response as later
+ * requests and never retain a credential body in this cache.
  */
 export function idempotencyInFlightBegin(
   key: string,
-): Promise<CachedResponse> | null {
+): Promise<IdempotencyRecord> | null {
   if (!isValidIdempotencyKey(key)) return null;
 
   const now = Date.now();
   const ttl = ttlMs();
-
-  // Prune stale slots: a leader that crashed — or one that simply ran longer
-  // than the TTL — must not block retries forever. This is a deliberate
-  // liveness-vs-deduplication tradeoff: a slow-but-live leader past TTL can be
-  // superseded, allowing a late duplicate to execute concurrently.
   pruneStaleInFlight(now, ttl);
 
   const existing = inFlight.get(key);
   if (existing) return existing.promise;
 
-  let resolve!: (response: CachedResponse) => void;
+  let resolve!: (record: IdempotencyRecord) => void;
   let reject!: (error: unknown) => void;
-  const promise = new Promise<CachedResponse>((res, rej) => {
+  const promise = new Promise<IdempotencyRecord>((res, rej) => {
     resolve = res;
     reject = rej;
   });
-  // Mark the promise as handled even if nobody awaits it (a slot that is
-  // pruned or failed with no waiting duplicate must not crash the process
-  // with an unhandled rejection).
   promise.catch(() => {});
 
   inFlight.set(key, { startedAt: now, promise, resolve, reject });
@@ -210,22 +384,21 @@ export function idempotencyInFlightBegin(
 }
 
 /**
- * Resolve the in-flight slot for `key` with the produced response.
- * Any duplicate requests that joined the slot will replay this response.
+ * Resolve the in-flight slot for `key` with a minimal record.
  */
 export function idempotencyInFlightSettle(
   key: string,
-  response: CachedResponse,
+  record: IdempotencyRecord,
 ): void {
   const entry = inFlight.get(key);
   if (!entry) return;
   inFlight.delete(key);
-  entry.resolve(response);
+  entry.resolve(record);
 }
 
 /**
  * Reject the in-flight slot for `key` when the leader failed before producing
- * a response. Waiting duplicates will fall back to processing their own request.
+ * a record. Waiting duplicates can process their own request.
  */
 export function idempotencyInFlightFail(key: string, error: unknown): void {
   const entry = inFlight.get(key);

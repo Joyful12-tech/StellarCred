@@ -30,6 +30,24 @@ export interface Config {
   rateLimitWindowMs: number;
   rateLimitMax: number;
   rateLimitEnabled: boolean;
+  /**
+   * When set, /claims, /stats, and /recent require the key as either:
+   *   Authorization: Bearer <key>   or   X-API-Key: <key>
+   * Absent or empty → public mode. Treated as optional so Partial<Config>
+   * exposes it in tests without requiring every caller to supply it.
+   */
+  apiKey?: string;
+  /** HMAC key used to sign outbound claim lifecycle webhooks. */
+  webhookSigningSecret?: string;
+  /**
+   * Run the on-chain data-integrity check (#612) on a schedule, re-reading a
+   * rotating sample of indexed claims out of ProofRegistry state.
+   */
+  integrityCheckEnabled: boolean;
+  /** Interval between integrity checks, in milliseconds. */
+  integrityCheckIntervalMs: number;
+  /** Claims compared against contract state per check. */
+  integrityCheckSampleSize: number;
 }
 
 function required(name: string): string {
@@ -105,6 +123,19 @@ export function loadConfig(): Config {
   );
   const rateLimitEnabled =
     optional("RATE_LIMIT_ENABLED", "true").toLowerCase() !== "false";
+  const webhookSigningSecret = process.env["WEBHOOK_SIGNING_SECRET"]?.trim();
+  if (webhookSigningSecret && webhookSigningSecret.length < 32) {
+    throw new Error("WEBHOOK_SIGNING_SECRET must contain at least 32 characters");
+  }
+
+  // ── On-chain data-integrity checks (#612) ──────────────────────────────────
+  // A periodic sampler keeps the derived claims table honest against the
+  // contract it was derived from. Values are clamped rather than rejected so a
+  // typo degrades to a sane schedule instead of taking the indexer down.
+  const integrityIntervalSec = Number(optional("INTEGRITY_CHECK_INTERVAL_SECONDS", "900"));
+  const integritySampleSize = Number(optional("INTEGRITY_CHECK_SAMPLE_SIZE", "25"));
+  const integrityCheckEnabled =
+    optional("INTEGRITY_CHECK_ENABLED", "true").toLowerCase() !== "false";
 
   return {
     stellarNetwork: network,
@@ -124,5 +155,15 @@ export function loadConfig(): Config {
     rateLimitWindowMs: (Number.isFinite(windowSec) && windowSec > 0 ? windowSec : 60) * 1000,
     rateLimitMax: Number.isFinite(maxReq) && maxReq > 0 ? maxReq : 120,
     rateLimitEnabled,
+    webhookSigningSecret,
+    integrityCheckEnabled,
+    integrityCheckIntervalMs:
+      Number.isFinite(integrityIntervalSec) && integrityIntervalSec > 0
+        ? integrityIntervalSec * 1000
+        : 900_000,
+    integrityCheckSampleSize:
+      Number.isFinite(integritySampleSize) && integritySampleSize > 0
+        ? Math.floor(integritySampleSize)
+        : 25,
   };
 }

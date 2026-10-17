@@ -15,6 +15,7 @@ import http from "http";
 import { loadConfig } from "./config";
 import { createDb } from "./db";
 import { createIngester } from "./ingester";
+import { createIntegrityChecker } from "./integrity";
 import { buildApp } from "./api";
 
 async function main(): Promise<void> {
@@ -29,8 +30,15 @@ async function main(): Promise<void> {
   const ingester = createIngester(config, db);
   ingester.start();
 
+  // ── On-chain data-integrity checks (#612) ────────────────────────────────
+  // Periodically re-reads a rotating sample of claims out of contract state so
+  // drift in the event-derived table surfaces as a metric instead of silently
+  // wrong answers for consumers.
+  const integrity = createIntegrityChecker(config, db);
+  integrity.start();
+
   // ── HTTP API ──────────────────────────────────────────────────────────────
-  const app = buildApp(db, ingester, config);
+  const app = buildApp(db, ingester, config, integrity);
   const server = http.createServer(app);
 
   await new Promise<void>((resolve, reject) => {
@@ -44,6 +52,7 @@ async function main(): Promise<void> {
     console.log("[indexer] Shutting down…");
     ingester.stop();
     await ingester.shutdown();
+    await integrity.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await db.close();
     console.log("[indexer] Goodbye.");
