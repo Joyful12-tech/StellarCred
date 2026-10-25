@@ -55,18 +55,35 @@ You can also verify the committed artifacts at any time:
 node circuits/scripts/stamp-circuit-version.js check-all ../frontend/public/circuits
 ```
 
-### Test Vectors
+### Test Vectors & Toolchain Drift Check
 
-`circuits/testvectors/<circuit>.json` pins, per circuit, the exact witness in its committed `Prover.toml`, the public inputs it derives, and a `sha256` hash of the resulting Barretenberg VK — captured with the pinned toolchain above. `circuits/scripts/testvectors.js check` (run in CI on every push/PR) recompiles and re-proves each circuit from its committed `Prover.toml` and fails the build if any of those three drift from what's committed, so a circuit-logic change, a witness edit, or a toolchain bump that silently changes proof output gets caught instead of surfacing later as an on-chain verification failure.
+`circuits/testvectors/<circuit>.json` pins, per circuit, the exact witness in its committed `Prover.toml`, the public inputs it derives, and a `sha256` hash of the resulting Barretenberg VK — captured with the pinned toolchain above (`nargo 1.0.0-beta.9` and `bb 0.87.0`).
 
-To regenerate the vectors intentionally (after a deliberate circuit change or a pinned toolchain bump — update `NOIR_VERSION`/`BB_VERSION` in `circuits/scripts/testvectors.js` first if it's the latter):
+In CI and local verification:
+- A focused check runs against a representative circuit (`kyc_proof`), which contains the smallest full cryptographic pipeline (Poseidon2 commitment + secp256k1 ECDSA):
+  ```bash
+  export PATH="$HOME/.nargo/bin:$HOME/.bb/bin:$PATH"
+  node circuits/scripts/testvectors.js check kyc_proof
+  ```
+- **Toolchain Drift Fail-Fast**: If the installed toolchain version differs from the pinned versions, the check halts immediately with `[TOOLCHAIN MISMATCH]` before running expensive proof generation, ensuring toolchain drift is clearly differentiated from circuit code regressions.
+- **Circuit Code Drift**: If the toolchain matches but compiled output differs from `circuits/testvectors/<circuit>.json`, the check reports `[CIRCUIT DRIFT]`.
 
-```bash
-export PATH="$HOME/.nargo/bin:$HOME/.bb/bin:$PATH"
-node circuits/scripts/testvectors.js update
-```
-
-Review the diff before committing — every field changing except `witness` usually means something other than the intended change moved. Each vector also pins the circuit's declared `circuit_version` / `circuit_vk_version`, so regenerating vectors for a circuit whose version was not bumped in `circuits/circuit-versions.json` is reported as drift. See [Circuit Versions](#circuit-versions).
+#### Updating Toolchain Pins & Test Vectors (Intentional Changes)
+When intentionally upgrading the toolchain or changing circuit logic:
+1. Update `NOIR_VERSION` and `BB_VERSION` in:
+   - `circuits/scripts/testvectors.js`
+   - `circuits/scripts/build.sh`
+   - `.github/workflows/proving-perf.yml`
+   - `circuits/README.md`
+2. Bump the corresponding circuit version in `circuits/circuit-versions.json`.
+3. Re-generate test vectors:
+   ```bash
+   export PATH="$HOME/.nargo/bin:$HOME/.bb/bin:$PATH"
+   node circuits/scripts/testvectors.js update
+   # Or for a specific circuit:
+   node circuits/scripts/testvectors.js update kyc_proof
+   ```
+4. Review git diff and commit the updated fixtures and test vectors. See [Circuit Versions](#circuit-versions).
 
 ---
 
@@ -201,3 +218,76 @@ trivially satisfiable and proves nothing.
 | 2 | `issuer_y` | `[u8; 32]` | Issuer secp256k1 public key Y coordinate |
 | 3 | `restricted` | `[u64; 8]` | List of up to 8 ISO 3166-1 numeric codes (padded with `0`s) |
 | 4 | `mode` | `u64` | Proof mode: `0` = denylist (country NOT in list), `1` = allowlist (country IS in list) |
+
+`mode` is a public input, not a second circuit: one compiled `jurisdiction_proof`
+serves both modes, so denylist and allowlist proofs verify against the *same* VK
+(`fixtures/jurisdiction/vk` and `fixtures/jurisdiction_allow/vk` are byte-identical).
+`circuits/scripts/build.sh` generates the second fixture set from
+`jurisdiction_proof/Prover_allowlist.toml` purely to have a real allowlist proof on
+hand for contract tests.
+
+Because both the list and the mode travel with the proof and are prover-supplied, the
+circuit only proves the *relation* — it cannot tell a verifier whether the accepted
+jurisdictions were the intended ones. A verifier that means "not sanctioned" must
+reject a proof presenting `mode = 1`, and one that means "region exclusive" must
+reject `mode = 0`; checking the mode alongside the list is the integrator's job.
+The witness API defaults to `mode = "0"` (`frontend/app/api/witness/route.ts`).
+
+### `composite_proof`
+
+A single-proof boolean policy over multiple committed attributes. The circuit evaluates a fixed-shape formula and reveals only the final `pass` bit — no attribute values, thresholds, or intermediate term results are leaked.
+
+Each attribute is independently committed and signed by an issuer, so the proof attests that every leaf is backed by a valid issuer signature over its commitment.
+
+#### Policy encoding
+
+The policy is a two-level boolean formula over a bounded number of terms:
+
+- **Max terms: 4 clauses** (`MAX_CLAUSES = 4`). Each clause is an AND of up to **2 comparisons** (`MAX_COMPS = 2`). The clauses are combined with OR. This yields a fixed circuit shape of at most 8 leaf comparisons and keeps the constraint count bounded for provability.
+
+```pass = (C0.c0 && C0.c1) || (C1.c0 && C1.c1) || (C2.c0 && C2.c1) || (C3.c0 && C3.c1)
+```
+
+Unused clauses and unused comparisons within a clause are disabled by setting their `op` to `0` (the clause is then forced true so it does not affect the final OR).
+
+Each comparison is encoded as a tuple of public parameters:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `op` | `u64` | `0` = comparison disabled (always true); `1` = enabled |
+| `attribute` | `u64` | Which committed attribute this comparison reads: `0` = accreditation, `1` = income, `2` = funds, `3` = jurisdiction, `4` = age (DOB days) |
+| `kind` | `u64` | Comparison kind: `0` = `>= threshold`, `1` = `<= threshold`, `2` = membership in `list` |
+| `threshold` | `u64` | RHS of the `>=`/`<=` comparison (ignored for membership) |
+| `list_idx` | `u64` | Index into the shared `list` for membership comparisons (ignored for thresholds) |
+
+The shared membership list is `[list; 8]` of ISO 3166-1 numeric codes, padded with `0`s. A membership comparison is true if the attribute value equals any non-zero entry in the list.
+
+Example policy — "(accredited OR income >= 200000) AND jurisdiction in {840, 826}":
+
+```toml
+clauses = [
+  [ { op = 1, attribute = 0, kind = 0, threshold = 1000000, list_idx = 0 },
+    { op = 1, attribute = 1, kind = 0, threshold = 200000, list_idx = 0 } ],
+  [ { op = 1, attribute = 3, kind = 2, threshold = 0, list_idx = 0 },
+    { op = 0, attribute = 0, kind = 0, threshold = 0, list_idx = 0 } ],
+  [ { op = 0, }, { op = 0, } ],
+  [ { op = 0, }, { op = 0, } ],
+]
+list = [840, 826, 0, 0, 0, 0, 0, 0]
+```
+
+The witness carries the four attribute values and salts (accreditation, income, funds, jurisdiction), each with its own issuer signature. The circuit recomputes each commitment, verifies each ECDSA signature, evaluates the policy, and asserts `pass == 1`.
+
+The public inputs for `composite_proof` are:
+
+| Index | Name | Type | Description |
+|-------|------|------|-------------|
+| 0 | `commitment_accreditation` | `Field` | `Poseidon2([net_worth, salt], 2)` |
+| 1 | `commitment_income` | `Field` | `Poseidon2([income, salt], 2)` |
+| 2 | `commitment_funds` | `Field` | `Poseidon2([balance, salt], 2)` |
+| 3 | `commitment_jurisdiction` | `Field` | `Poseidon2([country_code, salt], 2)` |
+| 4 | `issuer_x` | `[u8; 32]` | Issuer secp256k1 public key X coordinate (shared across all attributes) |
+| 5 | `issuer_y` | `[u8; 32]` | Issuer secp256k1 public key Y coordinate (shared across all attributes) |
+| 6 | `clauses` | `[[Comparison; 2]; 4]` | Four clauses, two comparisons each (the policy encoding above) |
+| 7 | `list` | `[u64; 8]` | Shared membership list (ISO 3166-1 numeric, padded with `0`s) |
+| 8 | `pass` | `bool` | The single revealed result of the policy evaluation |

@@ -1,7 +1,7 @@
 import "./globals.css";
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import localFont from "next/font/local";
-import { OnboardingTour } from "@/components/OnboardingTour";
 import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages } from "next-intl/server";
 import { SiteNav } from "@/components/SiteNav";
@@ -14,6 +14,10 @@ import { ToastProvider } from "@/components/Toast";
 import OnboardingWizard from "@/components/OnboardingWizardLazy";
 import { THEME_BOOT_SCRIPT } from "@/lib/theme";
 import type { Locale } from "@/i18n.config";
+// OnboardingWizard is deferred via next/dynamic(ssr:false) inside this client
+// wrapper. next/dynamic with ssr:false cannot be used directly in a Server
+// Component, so the call lives in a "use client" boundary.
+import { OnboardingOverlays } from "@/components/OnboardingOverlays";
 
 // Fonts are vendored as latin-subset variable woff2 files (from Google Fonts)
 // instead of next/font/google: the google loader downloads at build time,
@@ -21,9 +25,7 @@ import type { Locale } from "@/i18n.config";
 const body = localFont({
   variable: "--font-body",
   preload: false,
-  src: [
-    { path: "./fonts/inter-latin.woff2", weight: "400 500", style: "normal" },
-  ],
+  src: [{ path: "./fonts/inter-latin.woff2", weight: "400 500", style: "normal" }],
 });
 
 const display = localFont({
@@ -58,11 +60,7 @@ export const metadata: Metadata = {
     "Zero-knowledge credentials on Stellar. Prove facts about yourself without the data ever touching the chain.",
 };
 
-export default async function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
   let locale = "en";
   try {
     locale = await getLocale();
@@ -77,6 +75,8 @@ export default async function RootLayout({
     messages = {};
   }
 
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
+
   return (
     <html
       lang={locale}
@@ -86,6 +86,7 @@ export default async function RootLayout({
       <head>
         <script
           id="theme-detection"
+          nonce={nonce}
           dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }}
         />
         <LocaleMetaTags locale={locale as Locale} />
@@ -97,11 +98,10 @@ export default async function RootLayout({
         <NextIntlClientProvider messages={messages} locale={locale}>
           <ToastProvider>
             <WalletProvider>
-              <OnboardingTour />
+              <OnboardingOverlays />
               <SiteNav />
               <NetworkBanner />
               <RpcStatusBanner />
-              <OnboardingWizard />
               <main id="main-content" tabIndex={-1} className="container">
                 {children}
               </main>

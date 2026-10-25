@@ -9,6 +9,9 @@ import { useToast } from "@/components/Toast";
 // Lazy-load QrScanner (and with it the jsqr library, ~40 kB gzipped) only
 // when the user actually clicks "Scan QR". Most /verify visits never open the
 // scanner, so this keeps jsqr out of the critical-path bundle entirely.
+// jsqr is a ~60 kB camera-decoding library — only needed when the user
+// actively opens the QR scanner. Load it lazily so it stays out of the
+// initial verify-page bundle.
 const QrScanner = dynamic(
   () => import("@/components/QrScanner").then((m) => m.QrScanner),
   {

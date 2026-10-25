@@ -32,6 +32,8 @@ export * from "./capabilities";
 export * from "./challenge";
 export * from "./subscriptions";
 export * from "./errors"; // Typed error taxonomy (#404)
+export * from "./validateCredential"; // Credential JSON validation (#27)
+export * from "./buildVerifyUrl";
 export { submitTransaction } from "./submit"; // Transaction submission with retry (#744)
 export type { SubmitTransactionOptions } from "./submit";
 export { createClaimGate } from "./core";
@@ -59,6 +61,11 @@ import {
   normalizeRpcError,
   classifyTransientFailure,
   CLAIM_TYPES,
+  deriveNullifier,
+  isNullifierUsed,
+  verifyUniquePersonhood,
+  invalidateClaimCache,
+  clearClaimCache,
   TimeoutError,
   ConfigError,
   InvalidAddressError,
@@ -75,19 +82,18 @@ import {
 
 import { submitTransaction } from "./submit";
 
-import {
-  bootstrap,
-  fetchCapabilities,
-  validateCapabilitiesDescriptor,
-} from "./capabilities";
+import { bootstrap, fetchCapabilities, validateCapabilitiesDescriptor } from "./capabilities";
 
-import {
-  createWalletChallenge,
-  verifyWalletSignature,
-  verifyWalletClaim,
-} from "./challenge";
+import { createWalletChallenge, verifyWalletSignature, verifyWalletClaim } from "./challenge";
 
 import { subscribeClaims } from "./subscriptions";
+
+import {
+  validateCredential,
+  parseCredentialJson,
+  assertValidCredential,
+  CredentialValidationError,
+} from "./validateCredential";
 
 export const StellarCred = {
   configure,
@@ -108,15 +114,25 @@ export const StellarCred = {
   buildBadgeEmbedCode,
   parseReturnParams,
   watchClaim,
+  /** Drop cached claim reads for a wallet (see `configure({ claimCache })`). */
+  invalidate: invalidateClaimCache,
+  invalidateClaimCache,
+  clearClaimCache,
   withRetry,
   normalizeRpcError,
   classifyTransientFailure,
   submitTransaction,
+  validateCredential,
+  parseCredentialJson,
+  assertValidCredential,
   subscribeClaims,
   createWalletChallenge,
   verifyWalletSignature,
   verifyWalletClaim,
   CLAIM_TYPES,
+  deriveNullifier,
+  isNullifierUsed,
+  verifyUniquePersonhood,
   TimeoutError,
   ConfigError,
   InvalidAddressError,
@@ -125,6 +141,7 @@ export const StellarCred = {
   ContractError,
   ContractErrorCode,
   TransactionSubmissionError,
+  CredentialValidationError,
   parseContractError,
 };
 export default StellarCred;
