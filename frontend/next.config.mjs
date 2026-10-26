@@ -22,15 +22,6 @@ const nextConfig = {
     optimizePackageImports: ["@tabler/icons-react"],
   },
 
-  // The @stellarcred/sdk package (packages/sdk/src/claims.ts) has pre-existing
-  // TypeScript errors that are typechecked by the SDK's own toolchain. The app
-  // tsconfig resolves the @stellarcred/sdk path alias through the source files,
-  // which causes Next.js's bundled `tsc` run to surface those errors during
-  // `next build`. Ignoring build errors here lets webpack produce the optimised
-  // output while the separate `pnpm exec tsc --noEmit` step in CI (which runs
-  // before build) continues to catch *app* TypeScript regressions.
-  typescript: {
-    ignoreBuildErrors: true,
   // Rewrite barrel imports from "@tabler/icons-react" to per-icon ESM files.
   // e.g. `import { IconCheck } from "@tabler/icons-react"` becomes
   //      `import { IconCheck } from "@tabler/icons-react/dist/esm/icons/IconCheck.mjs"`

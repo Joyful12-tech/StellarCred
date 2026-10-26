@@ -12,23 +12,12 @@ import { ConfigBanner } from "@/components/ConfigBanner";
 import { issuanceConfigured } from "@/lib/config";
 import { truncateAddress, truncatePubkey } from "@/lib/format";
 import type { RegisteredIssuer } from "@/lib/issuer-registry";
-import dynamic from "next/dynamic";
+import { CredentialTemplateGallery } from "@/components/CredentialTemplateGallery";
 import type { CredentialTemplate } from "@/lib/credential-templates";
 import { CredentialPreview } from "@/components/CredentialPreview";
 import { normalizeAttributes } from "@/lib/attribute-normalizer";
 import { buildClaimLabel, type CredentialPreviewData } from "@/lib/credential-preview";
 
-// Lazy-load CredentialTemplateGallery — only needed when the issuer page fully
-// renders in the browser. Keeps it out of the initial SSR chunk.
-const CredentialTemplateGallery = dynamic(
-  () => import("@/components/CredentialTemplateGallery").then((m) => m.CredentialTemplateGallery),
-  { ssr: false },
-);
-
-const TYPES = Object.entries(TYPE_META) as [
-  CredentialType,
-  (typeof TYPE_META)[CredentialType],
-][];
 const TYPES = Object.entries(TYPE_META) as [CredentialType, (typeof TYPE_META)[CredentialType]][];
 
 // Sensible default attribute per type (the issuer can change it).
