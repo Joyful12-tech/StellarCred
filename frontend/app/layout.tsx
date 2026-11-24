@@ -1,10 +1,12 @@
 import "./globals.css";
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import localFont from "next/font/local";
 import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages } from "next-intl/server";
 import { SiteNav } from "@/components/SiteNav";
 import { NetworkBanner } from "@/components/NetworkBanner";
+import { WalletReconnectBanner } from "@/components/WalletReconnectBanner";
 import { RpcStatusBanner } from "@/components/RpcStatusBanner";
 import { Footer } from "@/components/Footer";
 import { LocaleMetaTags } from "@/components/LocaleMetaTags";
@@ -73,6 +75,8 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     messages = {};
   }
 
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
+
   return (
     <html
       lang={locale}
@@ -80,7 +84,11 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       suppressHydrationWarning
     >
       <head>
-        <script id="theme-detection" dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
+        <script
+          id="theme-detection"
+          nonce={nonce}
+          dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }}
+        />
         <LocaleMetaTags locale={locale as Locale} />
       </head>
       <body>
@@ -92,6 +100,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             <WalletProvider>
               <OnboardingOverlays />
               <SiteNav />
+              <WalletReconnectBanner />
               <NetworkBanner />
               <RpcStatusBanner />
               <main id="main-content" tabIndex={-1} className="container">
